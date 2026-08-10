@@ -10,9 +10,32 @@ try:
 except ImportError:  # pragma: no cover
     load_dotenv = None
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "expenses.db")
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
-ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+def _resolve_writable_path(filename: str, env_var: str):
+    explicit_path = os.getenv(env_var)
+    if explicit_path:
+        return explicit_path
+
+    preferred_paths = [
+        os.path.join(os.getcwd(), filename),
+        os.path.join(os.getcwd(), "data", filename),
+        os.path.join("/tmp", "expense_tracker", filename),
+    ]
+
+    for path in preferred_paths:
+        try:
+            parent_dir = os.path.dirname(path) or "."
+            os.makedirs(parent_dir, exist_ok=True)
+            if os.access(parent_dir, os.W_OK):
+                return path
+        except Exception:
+            continue
+
+    return os.path.join(os.getcwd(), filename)
+
+
+DB_PATH = _resolve_writable_path("expenses.db", "DB_PATH")
+CATEGORIES_PATH = _resolve_writable_path("categories.json", "CATEGORIES_PATH")
+ENV_PATH = _resolve_writable_path(".env", "ENV_PATH")
 
 if load_dotenv is not None:
     load_dotenv(ENV_PATH)
@@ -26,64 +49,79 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
 mcp = FastMCP("ExpenseTracker")
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS expenses(
+    global DB_PATH
+
+    candidate_paths = [DB_PATH]
+    if DB_PATH != os.path.join("/tmp", "expense_tracker", "expenses.db"):
+        candidate_paths.append(os.path.join("/tmp", "expense_tracker", "expenses.db"))
+
+    last_error = None
+    for path in candidate_paths:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with sqlite3.connect(path) as c:
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS expenses(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        date TEXT NOT NULL,
+                        amount REAL NOT NULL,
+                        category TEXT NOT NULL,
+                        subcategory TEXT DEFAULT '',
+                        note TEXT DEFAULT ''
+                    )
+                """)
+                c.execute("""
+            CREATE TABLE IF NOT EXISTS credits(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT NOT NULL,
                 amount REAL NOT NULL,
-                category TEXT NOT NULL,
-                subcategory TEXT DEFAULT '',
+                source TEXT NOT NULL,
                 note TEXT DEFAULT ''
             )
-        """)
-        c.execute("""
-    CREATE TABLE IF NOT EXISTS credits(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL,
-        amount REAL NOT NULL,
-        source TEXT NOT NULL,
-        note TEXT DEFAULT ''
-    )
 
-""")
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS shared_expenses(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL,
-        description TEXT,
-        total_amount REAL NOT NULL,
-        paid_by TEXT NOT NULL
-    )
-    """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS shared_expense_participants(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        expense_id INTEGER NOT NULL,
-        participant TEXT NOT NULL,
-        share_amount REAL NOT NULL,
-        FOREIGN KEY(expense_id)
-        REFERENCES shared_expenses(id)
-        )
         """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS friends(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS shared_expenses(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                description TEXT,
+                total_amount REAL NOT NULL,
+                paid_by TEXT NOT NULL
             )
             """)
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS shared_expense_participants(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                expense_id INTEGER NOT NULL,
+                participant TEXT NOT NULL,
+                share_amount REAL NOT NULL,
+                FOREIGN KEY(expense_id)
+                REFERENCES shared_expenses(id)
+                )
+                """)
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS friends(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    email TEXT UNIQUE
+                    )
+                    """)
 
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS settlements(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            person TEXT NOT NULL,
-            amount REAL NOT NULL,
-            settlement_date TEXT NOT NULL,
-            note TEXT DEFAULT ''
-        )
-        """)
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS settlements(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    settlement_date TEXT NOT NULL,
+                    note TEXT DEFAULT ''
+                )
+                """)
+            DB_PATH = path
+            return
+        except Exception as exc:
+            last_error = exc
 
+    raise RuntimeError(f"Unable to initialize database: {last_error}")
 init_db()
 
 @mcp.tool()
