@@ -63,6 +63,16 @@ async def _run_with_connection(operation):
         return await operation(conn)
 
 
+async def _execute_fetchall(conn, query, params=()):
+    cursor = await conn.execute(query, params)
+    return await cursor.fetchall()
+
+
+async def _execute_fetchone(conn, query, params=()):
+    cursor = await conn.execute(query, params)
+    return await cursor.fetchone()
+
+
 async def init_db():
     global DB_PATH
 
@@ -159,13 +169,13 @@ def _normalize_payer_name_sync(paid_by: str):
 async def _calculate_balances(conn):
     balances = {}
 
-    expense_rows = await conn.execute_fetchall(
-        "SELECT id, paid_by FROM shared_expenses"
+    expense_rows = await _execute_fetchall(
+        conn, "SELECT id, paid_by FROM shared_expenses"
     )
 
     for expense_id, paid_by in expense_rows:
-        participant_rows = await conn.execute_fetchall(
-            "SELECT participant, share_amount FROM shared_expense_participants WHERE expense_id=?",
+        participant_rows = await _execute_fetchall(
+            conn, "SELECT participant, share_amount FROM shared_expense_participants WHERE expense_id=?",
             (expense_id,)
         )
 
@@ -188,8 +198,8 @@ async def _calculate_balances(conn):
         if payer_name:
             balances[payer_name] = balances.get(payer_name, 0.0) + round(others_total, 2)
 
-    settlement_rows = await conn.execute_fetchall(
-        "SELECT person, amount FROM settlements"
+    settlement_rows = await _execute_fetchall(
+        conn, "SELECT person, amount FROM settlements"
     )
 
     for person, amount in settlement_rows:
@@ -421,7 +431,7 @@ async def delete_expense(date: str, amount: float, category: str, subcategory: s
             query += " AND subcategory=?"
             params.append(subcategory)
 
-        rows = await conn.execute_fetchall(query, params)
+        rows = await _execute_fetchall(conn, query, params)
 
         if len(rows) == 0:
             return {"status": "error", "message": "No matching expense found"}
@@ -453,7 +463,8 @@ async def delete_expense(date: str, amount: float, category: str, subcategory: s
 @mcp.tool(description="Edit an existing expense using known details.")
 async def edit_expense(old_date: str, old_amount: float, old_category: str, new_date: str = None, new_amount: float = None, new_category: str = None, new_subcategory: str = None, new_note: str = None):
     async def _op(conn):
-        rows = await conn.execute_fetchall(
+        rows = await _execute_fetchall(
+            conn,
             """
             SELECT id, date, amount, category, subcategory, note
             FROM expenses
@@ -558,7 +569,7 @@ async def add_friend(name: str, email: str):
 async def update_friend_email(name: str, new_email: str):
     async with db_lock:
         async def _op(conn):
-            row = await conn.execute_fetchone("SELECT id FROM friends WHERE LOWER(name)=LOWER(?)", (name,))
+            row = await _execute_fetchone(conn, "SELECT id FROM friends WHERE LOWER(name)=LOWER(?)", (name,))
             if not row:
                 return {"status": "error", "message": f"Friend '{name}' not found"}
             await conn.execute("UPDATE friends SET email=? WHERE LOWER(name)=LOWER(?)", (new_email, name))
@@ -610,8 +621,8 @@ async def add_shared_expense(date: str, amount: float, paid_by: str, participant
 
             for entry in participant_splits:
                 person = entry["name"]
-                email_row = await conn.execute_fetchone(
-                    "SELECT email FROM friends WHERE LOWER(name)=LOWER(?)",
+                email_row = await _execute_fetchone(
+                    conn, "SELECT email FROM friends WHERE LOWER(name)=LOWER(?)",
                     (person,)
                 )
 
@@ -644,7 +655,7 @@ async def settle_payment(person: str, amount: float, settlement_date: str, note:
                 (person, amount, settlement_date, note)
             )
 
-            friend_row = await conn.execute_fetchone("SELECT email FROM friends WHERE LOWER(name)=LOWER(?)", (person,))
+            friend_row = await _execute_fetchone(conn, "SELECT email FROM friends WHERE LOWER(name)=LOWER(?)", (person,))
             if friend_row and friend_row[0]:
                 email_tasks.append(send_email(friend_row[0], "Settlement recorded", f"Hi {person},\n\nA settlement of ₹{amount:.2f} was recorded on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"))
 
