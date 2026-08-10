@@ -54,9 +54,11 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
 
 mcp = FastMCP("ExpenseTracker")
 db_lock = asyncio.Lock()
+_db_initialized = False
 
 
 async def _run_with_connection(operation):
+    await _ensure_db_initialized()
     async with aiosqlite.connect(DB_PATH) as conn:
         return await operation(conn)
 
@@ -340,11 +342,11 @@ async def send_email(recipient, subject, body):
         return False
 
 
-async def _bootstrap():
-    await init_db()
-
-
-asyncio.run(_bootstrap())
+async def _ensure_db_initialized():
+    global _db_initialized
+    if not _db_initialized:
+        await init_db()
+        _db_initialized = True
 
 
 @mcp.tool(description="Add a new regular expense entry to the database.")
