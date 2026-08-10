@@ -1,14 +1,20 @@
 from fastmcp import FastMCP
+import asyncio
 import os
-import sqlite3
-import smtplib
+import aiosqlite
+import aiofiles
 from email.mime.text import MIMEText
-from collections import defaultdict
+
+try:
+    import aiosmtplib
+except ImportError:
+    aiosmtplib = None
 
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover
     load_dotenv = None
+
 
 def _resolve_writable_path(filename: str, env_var: str):
     explicit_path = os.getenv(env_var)
@@ -47,8 +53,15 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
 
 mcp = FastMCP("ExpenseTracker")
+db_lock = asyncio.Lock()
 
-def init_db():
+
+async def _run_with_connection(operation):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        return await operation(conn)
+
+
+async def init_db():
     global DB_PATH
 
     candidate_paths = [DB_PATH]
@@ -59,393 +72,76 @@ def init_db():
     for path in candidate_paths:
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with sqlite3.connect(path) as c:
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS expenses(
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        date TEXT NOT NULL,
-                        amount REAL NOT NULL,
-                        category TEXT NOT NULL,
-                        subcategory TEXT DEFAULT '',
-                        note TEXT DEFAULT ''
-                    )
-                """)
-                c.execute("""
-            CREATE TABLE IF NOT EXISTS credits(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                amount REAL NOT NULL,
-                source TEXT NOT NULL,
-                note TEXT DEFAULT ''
-            )
 
-        """)
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS shared_expenses(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                description TEXT,
-                total_amount REAL NOT NULL,
-                paid_by TEXT NOT NULL
-            )
-            """)
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS shared_expense_participants(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                expense_id INTEGER NOT NULL,
-                participant TEXT NOT NULL,
-                share_amount REAL NOT NULL,
-                FOREIGN KEY(expense_id)
-                REFERENCES shared_expenses(id)
-                )
-                """)
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS friends(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE NOT NULL,
-                    email TEXT UNIQUE
-                    )
+            async def _setup():
+                async with aiosqlite.connect(path) as c:
+                    await c.execute("PRAGMA journal_mode=WAL")
+                    await c.execute("""
+                        CREATE TABLE IF NOT EXISTS expenses(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            date TEXT NOT NULL,
+                            amount REAL NOT NULL,
+                            category TEXT NOT NULL,
+                            subcategory TEXT DEFAULT '',
+                            note TEXT DEFAULT ''
+                        )
                     """)
+                    await c.execute("""
+                        CREATE TABLE IF NOT EXISTS credits(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            date TEXT NOT NULL,
+                            amount REAL NOT NULL,
+                            source TEXT NOT NULL,
+                            note TEXT DEFAULT ''
+                        )
+                    """)
+                    await c.execute("""
+                        CREATE TABLE IF NOT EXISTS shared_expenses(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            date TEXT NOT NULL,
+                            description TEXT,
+                            total_amount REAL NOT NULL,
+                            paid_by TEXT NOT NULL
+                        )
+                    """)
+                    await c.execute("""
+                        CREATE TABLE IF NOT EXISTS shared_expense_participants(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            expense_id INTEGER NOT NULL,
+                            participant TEXT NOT NULL,
+                            share_amount REAL NOT NULL,
+                            FOREIGN KEY(expense_id)
+                            REFERENCES shared_expenses(id)
+                        )
+                    """)
+                    await c.execute("""
+                        CREATE TABLE IF NOT EXISTS friends(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT UNIQUE NOT NULL,
+                            email TEXT UNIQUE
+                        )
+                    """)
+                    await c.execute("""
+                        CREATE TABLE IF NOT EXISTS settlements(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            person TEXT NOT NULL,
+                            amount REAL NOT NULL,
+                            settlement_date TEXT NOT NULL,
+                            note TEXT DEFAULT ''
+                        )
+                    """)
+                    await c.commit()
 
-                c.execute("""
-                CREATE TABLE IF NOT EXISTS settlements(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    person TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    settlement_date TEXT NOT NULL,
-                    note TEXT DEFAULT ''
-                )
-                """)
+            await _setup()
             DB_PATH = path
             return
         except Exception as exc:
             last_error = exc
 
     raise RuntimeError(f"Unable to initialize database: {last_error}")
-init_db()
 
-@mcp.tool()
-def add_expense(date, amount, category, subcategory="", note=""):
-    '''Add a new expense entry to the database.'''
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
-            "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-            (date, amount, category, subcategory, note)
-        )
-        return {"status": "ok", "id": cur.lastrowid}
-    
-@mcp.tool()
-def list_expenses(start_date, end_date):
-    '''List expense entries within an inclusive date range.'''
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
-            """
-            SELECT id, date, amount, category, subcategory, note
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            ORDER BY id ASC
-            """,
-            (start_date, end_date)
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-@mcp.tool()
-def summarize(start_date, end_date, category=None):
-    '''Summarize expenses by category within an inclusive date range.'''
-    with sqlite3.connect(DB_PATH) as c:
-        query = (
-            """
-            SELECT category, SUM(amount) AS total_amount
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            """
-        )
-        params = [start_date, end_date]
-
-        if category:
-            query += " AND category = ?"
-            params.append(category)
-
-        query += " GROUP BY category ORDER BY category ASC"
-
-        cur = c.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
-@mcp.tool()
-def delete_expense(
-    date: str,
-    amount: float,
-    category: str,
-    subcategory: str = None
-):
-    """Delete an expense using details instead of ID."""
-
-    with sqlite3.connect(DB_PATH) as c:
-        query = """
-        SELECT id, date, amount, category, subcategory, note
-        FROM expenses
-        WHERE date=? AND amount=? AND category=?
-        """
-
-        params = [date, amount, category]
-
-        if subcategory:
-            query += " AND subcategory=?"
-            params.append(subcategory)
-
-        rows = c.execute(query, params).fetchall()
-
-        if len(rows) == 0:
-            return {"status": "error", "message": "No matching expense found"}
-
-        if len(rows) > 1:
-            return {
-                "status": "multiple_matches",
-                "matches": [
-                    {
-                        "id": r[0],
-                        "date": r[1],
-                        "amount": r[2],
-                        "category": r[3],
-                        "subcategory": r[4],
-                        "note": r[5]
-                    }
-                    for r in rows
-                ]
-            }
-
-        expense_id = rows[0][0]
-
-        c.execute(
-            "DELETE FROM expenses WHERE id=?",
-            (expense_id,)
-        )
-
-        return {
-            "status": "ok",
-            "deleted_id": expense_id
-        }
-
-@mcp.tool()
-def edit_expense(
-    old_date: str,
-    old_amount: float,
-    old_category: str,
-    new_date: str = None,
-    new_amount: float = None,
-    new_category: str = None,
-    new_subcategory: str = None,
-    new_note: str = None
-):
-    """Edit an existing expense using known details."""
-
-    with sqlite3.connect(DB_PATH) as c:
-        rows = c.execute(
-            """
-            SELECT id, date, amount, category, subcategory, note
-            FROM expenses
-            WHERE date=? AND amount=? AND category=?
-            """,
-            (old_date, old_amount, old_category)
-        ).fetchall()
-
-        if len(rows) == 0:
-            return {
-                "status": "error",
-                "message": "No matching expense found."
-            }
-
-        if len(rows) > 1:
-            return {
-                "status": "multiple_matches",
-                "matches": [
-                    {
-                        "id": r[0],
-                        "date": r[1],
-                        "amount": r[2],
-                        "category": r[3],
-                        "subcategory": r[4],
-                        "note": r[5]
-                    }
-                    for r in rows
-                ]
-            }
-
-        expense = rows[0]
-
-        c.execute(
-            """
-            UPDATE expenses
-            SET date=?,
-                amount=?,
-                category=?,
-                subcategory=?,
-                note=?
-            WHERE id=?
-            """,
-            (
-                new_date if new_date is not None else expense[1],
-                new_amount if new_amount is not None else expense[2],
-                new_category if new_category is not None else expense[3],
-                new_subcategory if new_subcategory is not None else expense[4],
-                new_note if new_note is not None else expense[5],
-                expense[0]
-            )
-        )
-
-        return {
-            "status": "ok",
-            "expense_id": expense[0],
-            "message": "Expense updated successfully"
-        }
-
-@mcp.tool()
-def add_credit(
-    date: str,
-    amount: float,
-    source: str,
-    note: str = ""
-):
-    """
-    Record incoming money such as salary, reimbursement,
-    cashback, refund, bonus, etc.
-    """
-
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
-            """
-            INSERT INTO credits(date, amount, source, note)
-            VALUES (?, ?, ?, ?)
-            """,
-            (date, amount, source, note)
-        )
-
-        return {
-            "status": "ok",
-            "credit_id": cur.lastrowid,
-            "message": "Credit added successfully"
-        }
-
-@mcp.tool()
-def list_credits(
-    start_date: str,
-    end_date: str
-):
-    """
-    List all credited amounts within a date range.
-    """
-
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
-            """
-            SELECT
-                id,
-                date,
-                amount,
-                source,
-                note
-            FROM credits
-            WHERE date BETWEEN ? AND ?
-            ORDER BY date ASC
-            """,
-            (start_date, end_date)
-        )
-
-        cols = [d[0] for d in cur.description]
-
-        return [
-            dict(zip(cols, row))
-            for row in cur.fetchall()
-        ]
-
-#################################################################################3
-@mcp.tool()
-def add_friend(name: str, email: str):
-    """Add a friend."""
-
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute(
-            """
-            INSERT INTO friends(name,email)
-            VALUES (?,?)
-            """,
-            (name, email)
-        )
-
-    return {
-        "status": "ok",
-        "message": f"{name} added"
-    }
-
-@mcp.tool()
-def update_friend_email(name: str, new_email: str):
-    """Update the email address for an existing friend."""
-
-    with sqlite3.connect(DB_PATH) as c:
-        row = c.execute(
-            "SELECT id FROM friends WHERE LOWER(name)=LOWER(?)",
-            (name,)
-        ).fetchone()
-
-        if not row:
-            return {"status": "error", "message": f"Friend '{name}' not found"}
-
-        c.execute(
-            "UPDATE friends SET email=? WHERE LOWER(name)=LOWER(?)",
-            (new_email, name)
-        )
-
-    return {
-        "status": "ok",
-        "message": f"Email updated for {name}"
-    }
-
-@mcp.tool()
-def list_friends():
-    """List all friends."""
-
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
-            "SELECT id,name,email FROM friends"
-        )
-
-        cols = [d[0] for d in cur.description]
-
-        return [
-            dict(zip(cols, row))
-            for row in cur.fetchall()
-        ]
-
-def send_email(recipient, subject, body):
-    if not recipient:
-        print("Email skipped: no recipient provided")
-        return False
-
-    if not SMTP_PASSWORD:
-        print("Email skipped: SMTP_PASSWORD is not configured")
-        return False
-
-    try:
-        text = body if body else ""
-        msg = MIMEText(text, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = SMTP_FROM
-        msg["To"] = recipient
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM, recipient, msg.as_string())
-
-        print(f"Email sent to {recipient}")
-        return True
-
-    except Exception as e:
-        print(f"Email failed: {e}")
-        return False
-
-def _normalize_payer_name(paid_by: str):
+async def _normalize_payer_name(paid_by: str):
     if not paid_by:
         return "You"
     lowered = str(paid_by).strip().lower()
@@ -454,27 +150,31 @@ def _normalize_payer_name(paid_by: str):
     return str(paid_by).strip()
 
 
-def _calculate_balances(conn):
+def _normalize_payer_name_sync(paid_by: str):
+    return asyncio.run(_normalize_payer_name(paid_by))
+
+
+async def _calculate_balances(conn):
     balances = {}
 
-    expense_rows = conn.execute(
+    expense_rows = await conn.execute_fetchall(
         "SELECT id, paid_by FROM shared_expenses"
-    ).fetchall()
+    )
 
     for expense_id, paid_by in expense_rows:
-        participant_rows = conn.execute(
+        participant_rows = await conn.execute_fetchall(
             "SELECT participant, share_amount FROM shared_expense_participants WHERE expense_id=?",
             (expense_id,)
-        ).fetchall()
+        )
 
         if not participant_rows:
             continue
 
-        payer_name = _normalize_payer_name(paid_by)
+        payer_name = await _normalize_payer_name(paid_by)
         others_total = 0.0
 
         for participant, share_amount in participant_rows:
-            participant_name = _normalize_payer_name(participant)
+            participant_name = await _normalize_payer_name(participant)
             share_value = round(float(share_amount), 2)
 
             if participant_name.lower() == payer_name.lower():
@@ -486,12 +186,12 @@ def _calculate_balances(conn):
         if payer_name:
             balances[payer_name] = balances.get(payer_name, 0.0) + round(others_total, 2)
 
-    settlement_rows = conn.execute(
+    settlement_rows = await conn.execute_fetchall(
         "SELECT person, amount FROM settlements"
-    ).fetchall()
+    )
 
     for person, amount in settlement_rows:
-        person_name = _normalize_payer_name(person)
+        person_name = await _normalize_payer_name(person)
         amount_value = round(float(amount), 2)
         current_balance = balances.get(person_name, 0.0)
 
@@ -505,7 +205,7 @@ def _calculate_balances(conn):
     return {name: round(balance, 2) for name, balance in balances.items()}
 
 
-def _coerce_number(value):
+async def _coerce_number(value):
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -520,7 +220,7 @@ def _coerce_number(value):
     return None
 
 
-def _build_participant_splits(amount: float, participants: list, paid_by: str):
+async def _build_participant_splits(amount: float, participants: list, paid_by: str):
     if not participants:
         return []
 
@@ -531,9 +231,9 @@ def _build_participant_splits(amount: float, participants: list, paid_by: str):
         elif isinstance(entry, dict):
             normalized.append({
                 "name": entry.get("name") or entry.get("participant") or entry.get("person"),
-                "percent": _coerce_number(entry.get("percent") or entry.get("percentage")),
-                "parts": _coerce_number(entry.get("parts") or entry.get("ratio") or entry.get("weight")),
-                "share": _coerce_number(entry.get("share") or entry.get("amount") or entry.get("value") or entry.get("owed") or entry.get("pay_amount"))
+                "percent": await _coerce_number(entry.get("percent") or entry.get("percentage")),
+                "parts": await _coerce_number(entry.get("parts") or entry.get("ratio") or entry.get("weight")),
+                "share": await _coerce_number(entry.get("share") or entry.get("amount") or entry.get("value") or entry.get("owed") or entry.get("pay_amount"))
             })
         else:
             normalized.append({"name": str(entry), "percent": None, "parts": None, "share": None})
@@ -573,8 +273,8 @@ def _build_participant_splits(amount: float, participants: list, paid_by: str):
     return result
 
 
-def _build_email_summary(paid_by: str, amount: float, description: str, participant_splits: list, balances: dict, recipient_name: str):
-    payer_name = _normalize_payer_name(paid_by)
+async def _build_email_summary(paid_by: str, amount: float, description: str, participant_splits: list, balances: dict, recipient_name: str):
+    payer_name = await _normalize_payer_name(paid_by)
     recipient_display = recipient_name or "there"
     recipient_share = None
 
@@ -590,12 +290,6 @@ def _build_email_summary(paid_by: str, amount: float, description: str, particip
                 recipient_balance = balance
                 break
 
-    settle_amount = None
-    if recipient_balance is not None:
-        settle_amount = abs(recipient_balance) if recipient_balance < 0 else 0.0
-    elif recipient_share is not None:
-        settle_amount = recipient_share
-
     lines = []
     lines.append(f"Hi {recipient_display},")
     lines.append("")
@@ -605,246 +299,380 @@ def _build_email_summary(paid_by: str, amount: float, description: str, particip
     lines.append("")
     lines.append(f"Your share for this expense: ₹{recipient_share:.2f}" if recipient_share is not None else "Your share for this expense: ₹0.00")
     lines.append("")
-
     lines.append("Shared expense summary:")
     for entry in participant_splits:
         lines.append(f"- {entry['name']}: ₹{entry['share']:.2f}")
     lines.append("")
-
     lines.append("Please settle whenever convenient.")
     lines.append("")
     lines.append("Thank you.")
     return "\n".join(lines)
 
-@mcp.tool()
-def edit_shared_expense(
-    expense_id: int,
-    new_date: str = None,
-    new_amount: float = None,
-    new_paid_by: str = None,
-    new_description: str = None,
-    new_participants: list = None
-):
-    """Edit an existing shared expense and its participant shares."""
-    with sqlite3.connect(DB_PATH) as c:
-        rows = c.execute(
-            "SELECT id, date, description, total_amount, paid_by FROM shared_expenses WHERE id=?",
-            (expense_id,)
-        ).fetchall()
-        if not rows:
-            return {"status": "error", "message": "Shared expense not found"}
 
-        expense = rows[0]
-        date_value = new_date if new_date is not None else expense[1]
-        description_value = new_description if new_description is not None else expense[2]
-        amount_value = new_amount if new_amount is not None else expense[3]
-        paid_by_value = new_paid_by if new_paid_by is not None else expense[4]
+async def send_email(recipient, subject, body):
+    if not recipient:
+        print("Email skipped: no recipient provided")
+        return False
 
-        c.execute(
-            "DELETE FROM shared_expense_participants WHERE expense_id=?",
-            (expense_id,)
-        )
+    if not SMTP_PASSWORD:
+        print("Email skipped: SMTP_PASSWORD is not configured")
+        return False
 
-        c.execute(
-            "UPDATE shared_expenses SET date=?, description=?, total_amount=?, paid_by=? WHERE id=?",
-            (date_value, description_value, amount_value, paid_by_value, expense_id)
-        )
+    if not aiosmtplib:
+        print("Email skipped: aiosmtplib not installed")
+        return False
 
-        if new_participants is not None:
-            participant_splits = _build_participant_splits(amount_value, new_participants, paid_by_value)
-            for entry in participant_splits:
-                c.execute(
-                    "INSERT INTO shared_expense_participants(expense_id, participant, share_amount) VALUES (?,?,?)",
-                    (expense_id, entry["name"], entry["share"])
-                )
-        else:
-            participant_splits = []
+    try:
+        text = body if body else ""
+        msg = MIMEText(text, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM
+        msg["To"] = recipient
 
-        return {
-            "status": "ok",
-            "expense_id": expense_id,
-            "splits": participant_splits
-        }
+        async with aiosmtplib.SMTP(hostname=SMTP_HOST, port=SMTP_PORT) as smtp:
+            await smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            await smtp.send_message(msg)
 
-@mcp.tool()
-def delete_shared_expense(expense_id: int):
-    """Delete a shared expense and all of its participant rows."""
-    with sqlite3.connect(DB_PATH) as c:
-        rows = c.execute("SELECT id FROM shared_expenses WHERE id=?", (expense_id,)).fetchall()
-        if not rows:
-            return {"status": "error", "message": "Shared expense not found"}
+        print(f"Email sent to {recipient}")
+        return True
+    except Exception as e:
+        print(f"Email failed: {e}")
+        return False
 
-        c.execute("DELETE FROM shared_expense_participants WHERE expense_id=?", (expense_id,))
-        c.execute("DELETE FROM shared_expenses WHERE id=?", (expense_id,))
 
-        return {"status": "ok", "deleted_expense_id": expense_id}
+async def _bootstrap():
+    await init_db()
 
-@mcp.tool()
-def list_shared_expenses():
-    """List all shared expense records."""
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
-            "SELECT id, date, description, total_amount, paid_by FROM shared_expenses ORDER BY id ASC"
+
+asyncio.run(_bootstrap())
+
+
+@mcp.tool(description="Add a new regular expense entry to the database.")
+async def add_expense(date, amount, category, subcategory="", note=""):
+    async with db_lock:
+        async def _op(conn):
+            cur = await conn.execute(
+                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
+                (date, amount, category, subcategory, note)
+            )
+            await conn.commit()
+            return {"status": "ok", "id": cur.lastrowid}
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="List expense entries within an inclusive date range.")
+async def list_expenses(start_date, end_date):
+    async def _op(conn):
+        cur = await conn.execute(
+            """
+            SELECT id, date, amount, category, subcategory, note
+            FROM expenses
+            WHERE date BETWEEN ? AND ?
+            ORDER BY id ASC
+            """,
+            (start_date, end_date)
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = await cur.fetchall()
+        return [dict(zip(cols, r)) for r in rows]
 
-@mcp.tool()
-def add_shared_expense(
-    date: str,
-    amount: float,
-    paid_by: str,
-    participants: list,
-    description: str = ""
-):
-    """
-    Split expense equally or by percentage/parts.
-    """
+    return await _run_with_connection(_op)
 
-    participant_splits = _build_participant_splits(amount, participants, paid_by)
-    payer_name = _normalize_payer_name(paid_by)
 
-    with sqlite3.connect(DB_PATH) as c:
+@mcp.tool(description="Summarize expenses by category within an inclusive date range.")
+async def summarize(start_date, end_date, category=None):
+    async def _op(conn):
+        query = """
+            SELECT category, SUM(amount) AS total_amount
+            FROM expenses
+            WHERE date BETWEEN ? AND ?
+        """
+        params = [start_date, end_date]
 
-        cur = c.execute(
+        if category:
+            query += " AND category = ?"
+            params.append(category)
+
+        query += " GROUP BY category ORDER BY category ASC"
+
+        cur = await conn.execute(query, params)
+        cols = [d[0] for d in cur.description]
+        rows = await cur.fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+
+    return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Delete an expense using its known details instead of an ID.")
+async def delete_expense(date: str, amount: float, category: str, subcategory: str = None):
+    async def _op(conn):
+        query = """
+        SELECT id, date, amount, category, subcategory, note
+        FROM expenses
+        WHERE date=? AND amount=? AND category=?
+        """
+
+        params = [date, amount, category]
+
+        if subcategory:
+            query += " AND subcategory=?"
+            params.append(subcategory)
+
+        rows = await conn.execute_fetchall(query, params)
+
+        if len(rows) == 0:
+            return {"status": "error", "message": "No matching expense found"}
+
+        if len(rows) > 1:
+            return {
+                "status": "multiple_matches",
+                "matches": [
+                    {
+                        "id": r[0],
+                        "date": r[1],
+                        "amount": r[2],
+                        "category": r[3],
+                        "subcategory": r[4],
+                        "note": r[5]
+                    }
+                    for r in rows
+                ]
+            }
+
+        expense_id = rows[0][0]
+        await conn.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
+        await conn.commit()
+        return {"status": "ok", "deleted_id": expense_id}
+
+    return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Edit an existing expense using known details.")
+async def edit_expense(old_date: str, old_amount: float, old_category: str, new_date: str = None, new_amount: float = None, new_category: str = None, new_subcategory: str = None, new_note: str = None):
+    async def _op(conn):
+        rows = await conn.execute_fetchall(
             """
-            INSERT INTO shared_expenses(
-                date,
-                description,
-                total_amount,
-                paid_by
-            )
-            VALUES (?,?,?,?)
+            SELECT id, date, amount, category, subcategory, note
+            FROM expenses
+            WHERE date=? AND amount=? AND category=?
             """,
-            (
-                date,
-                description,
-                amount,
-                payer_name
-            )
+            (old_date, old_amount, old_category)
         )
 
-        expense_id = cur.lastrowid
+        if len(rows) == 0:
+            return {"status": "error", "message": "No matching expense found."}
 
-        for entry in participant_splits:
-            person = entry["name"]
+        if len(rows) > 1:
+            return {
+                "status": "multiple_matches",
+                "matches": [
+                    {
+                        "id": r[0],
+                        "date": r[1],
+                        "amount": r[2],
+                        "category": r[3],
+                        "subcategory": r[4],
+                        "note": r[5]
+                    }
+                    for r in rows
+                ]
+            }
 
-            c.execute(
-                """
-                INSERT INTO shared_expense_participants(
-                    expense_id,
-                    participant,
-                    share_amount
-                )
-                VALUES (?,?,?)
-                """,
-                (
-                    expense_id,
-                    person,
-                    entry["share"]
-                )
-            )
-
-        balances = _calculate_balances(c)
-
-        for entry in participant_splits:
-            person = entry["name"]
-            email_row = c.execute(
-                """
-                SELECT email
-                FROM friends
-                WHERE LOWER(name)=LOWER(?)
-                """,
-                (person,)
-            ).fetchone()
-
-            if email_row and email_row[0]:
-                send_email(
-                    email_row[0],
-                    f"Expense Split: {description}",
-                    _build_email_summary(
-                        paid_by,
-                        amount,
-                        description,
-                        participant_splits,
-                        balances,
-                        person
-                    )
-                )
-
-    return {
-        "status": "ok",
-        "expense_id": expense_id,
-        "splits": participant_splits
-    }
-
-@mcp.tool()
-def settle_payment(
-    person: str,
-    amount: float,
-    settlement_date: str,
-    note: str = ""
-):
-    """Record settlement and notify both parties."""
-
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute(
+        expense = rows[0]
+        await conn.execute(
             """
-            INSERT INTO settlements(
-                person,
-                amount,
-                settlement_date,
-                note
-            )
-            VALUES (?,?,?,?)
+            UPDATE expenses
+            SET date=?,
+                amount=?,
+                category=?,
+                subcategory=?,
+                note=?
+            WHERE id=?
             """,
             (
-                person,
-                amount,
-                settlement_date,
-                note
+                new_date if new_date is not None else expense[1],
+                new_amount if new_amount is not None else expense[2],
+                new_category if new_category is not None else expense[3],
+                new_subcategory if new_subcategory is not None else expense[4],
+                new_note if new_note is not None else expense[5],
+                expense[0]
             )
         )
+        await conn.commit()
+        return {"status": "ok", "expense_id": expense[0], "message": "Expense updated successfully"}
 
-        friend_row = c.execute(
-            "SELECT email FROM friends WHERE LOWER(name)=LOWER(?)",
-            (person,)
-        ).fetchone()
+    return await _run_with_connection(_op)
 
-        if friend_row and friend_row[0]:
-            send_email(
-                friend_row[0],
-                "Settlement recorded",
-                f"Hi {person},\n\nA settlement of ₹{amount:.2f} was recorded on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"
+
+@mcp.tool(description="Record incoming money such as salary, reimbursement, cashback, refund, or bonus.")
+async def add_credit(date: str, amount: float, source: str, note: str = ""):
+    async with db_lock:
+        async def _op(conn):
+            cur = await conn.execute(
+                """
+                INSERT INTO credits(date, amount, source, note)
+                VALUES (?, ?, ?, ?)
+                """,
+                (date, amount, source, note)
             )
+            await conn.commit()
+            return {"status": "ok", "credit_id": cur.lastrowid, "message": "Credit added successfully"}
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="List all credited amounts within a date range.")
+async def list_credits(start_date: str, end_date: str):
+    async def _op(conn):
+        cur = await conn.execute(
+            """
+            SELECT id, date, amount, source, note
+            FROM credits
+            WHERE date BETWEEN ? AND ?
+            ORDER BY date ASC
+            """,
+            (start_date, end_date)
+        )
+        cols = [d[0] for d in cur.description]
+        rows = await cur.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Add a friend to the expense tracker so shared-expense emails can be sent to them.")
+async def add_friend(name: str, email: str):
+    async with db_lock:
+        async def _op(conn):
+            await conn.execute("INSERT INTO friends(name,email) VALUES (?,?)", (name, email))
+            await conn.commit()
+            return {"status": "ok", "message": f"{name} added"}
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Update the email address for an existing friend.")
+async def update_friend_email(name: str, new_email: str):
+    async with db_lock:
+        async def _op(conn):
+            row = await conn.execute_fetchone("SELECT id FROM friends WHERE LOWER(name)=LOWER(?)", (name,))
+            if not row:
+                return {"status": "error", "message": f"Friend '{name}' not found"}
+            await conn.execute("UPDATE friends SET email=? WHERE LOWER(name)=LOWER(?)", (new_email, name))
+            await conn.commit()
+            return {"status": "ok", "message": f"Email updated for {name}"}
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="List the friends that are currently registered in the tracker.")
+async def list_friends():
+    async def _op(conn):
+        cur = await conn.execute("SELECT id,name,email FROM friends")
+        cols = [d[0] for d in cur.description]
+        rows = await cur.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Create a shared expense and split it among participants, including optional email notifications.")
+async def add_shared_expense(date: str, amount: float, paid_by: str, participants: list, description: str = ""):
+    participant_splits = await _build_participant_splits(amount, participants, paid_by)
+    payer_name = await _normalize_payer_name(paid_by)
+
+    email_tasks = []
+
+    async with db_lock:
+        async def _op(conn):
+            cur = await conn.execute(
+                """
+                INSERT INTO shared_expenses(date, description, total_amount, paid_by)
+                VALUES (?,?,?,?)
+                """,
+                (date, description, amount, payer_name)
+            )
+            expense_id = cur.lastrowid
+
+            for entry in participant_splits:
+                await conn.execute(
+                    """
+                    INSERT INTO shared_expense_participants(expense_id, participant, share_amount)
+                    VALUES (?,?,?)
+                    """,
+                    (expense_id, entry["name"], entry["share"])
+                )
+
+            balances = await _calculate_balances(conn)
+
+            for entry in participant_splits:
+                person = entry["name"]
+                email_row = await conn.execute_fetchone(
+                    "SELECT email FROM friends WHERE LOWER(name)=LOWER(?)",
+                    (person,)
+                )
+
+                if email_row and email_row[0]:
+                    email_summary = await _build_email_summary(paid_by, amount, description, participant_splits, balances, person)
+                    email_tasks.append(send_email(email_row[0], f"Expense Split: {description}", email_summary))
+
+            await conn.commit()
+            return {"status": "ok", "expense_id": expense_id, "splits": participant_splits}
+
+        result = await _run_with_connection(_op)
+
+    if email_tasks:
+        await asyncio.gather(*email_tasks, return_exceptions=True)
+
+    return result
+
+
+@mcp.tool(description="Record a settlement payment and notify the involved parties.")
+async def settle_payment(person: str, amount: float, settlement_date: str, note: str = ""):
+    email_tasks = []
+
+    async with db_lock:
+        async def _op(conn):
+            await conn.execute(
+                """
+                INSERT INTO settlements(person, amount, settlement_date, note)
+                VALUES (?,?,?,?)
+                """,
+                (person, amount, settlement_date, note)
+            )
+
+            friend_row = await conn.execute_fetchone("SELECT email FROM friends WHERE LOWER(name)=LOWER(?)", (person,))
+            if friend_row and friend_row[0]:
+                email_tasks.append(send_email(friend_row[0], "Settlement recorded", f"Hi {person},\n\nA settlement of ₹{amount:.2f} was recorded on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"))
+
+            await conn.commit()
+            return {"status": "ok", "message": "Settlement recorded"}
+
+        result = await _run_with_connection(_op)
 
     if person and person.lower() != "you":
-        send_email(
-            SMTP_USERNAME,
-            "Settlement recorded",
-            f"Hi there,\n\nA settlement of ₹{amount:.2f} was recorded for {person} on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"
-        )
+        email_tasks.append(send_email(SMTP_USERNAME, "Settlement recorded", f"Hi there,\n\nA settlement of ₹{amount:.2f} was recorded for {person} on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"))
 
-    return {
-        "status": "ok",
-        "message": "Settlement recorded"
-    }
+    if email_tasks:
+        await asyncio.gather(*email_tasks, return_exceptions=True)
 
-@mcp.tool()
-def get_balances():
+    return result
 
-    with sqlite3.connect(DB_PATH) as c:
-        balances = _calculate_balances(c)
 
-    return balances
+@mcp.tool(description="Calculate the net balance for each person from shared expenses and settlements.")
+async def get_balances():
+    async def _op(conn):
+        return await _calculate_balances(conn)
+
+    return await _run_with_connection(_op)
 
 
 @mcp.resource("expense://categories", mime_type="application/json")
-def categories():
-    # Read fresh each time so you can edit the file without restarting
-    with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-        return f.read()
+async def categories():
+    async with aiofiles.open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+        return await f.read()
+
 
 if __name__ == "__main__":
-    #mcp.run()
     mcp.run(transport="http", host="0.0.0.0", port=8000)
