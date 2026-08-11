@@ -564,6 +564,8 @@ async def delete_expense(token: str, date: str, amount: float, category: str, su
             query += " AND subcategory=?"
             params.append(subcategory)
 
+        rows = await _execute_fetchall(conn, query, params)
+
         if len(rows) == 0:
             return {"status": "error", "message": "No matching expense found"}
 
@@ -855,4 +857,4 @@ async def categories():
 
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    mcp.run()
