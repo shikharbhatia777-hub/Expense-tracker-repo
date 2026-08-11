@@ -4,6 +4,10 @@ import os
 import aiosqlite
 import aiofiles
 from email.mime.text import MIMEText
+import jwt
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone as tz
 
 try:
     import aiosmtplib
@@ -52,9 +56,47 @@ SMTP_USERNAME = os.getenv("SMTP_USERNAME", "shikharbhatia777@gmail.com")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
 
+JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
+JWT_EXPIRY_HOURS = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
+
 mcp = FastMCP("ExpenseTracker")
 db_lock = asyncio.Lock()
 _db_initialized = False
+_current_user_id = None
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_hex(32)
+    password_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    return f"{salt}${password_hash.hex()}"
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    try:
+        salt, password_hash = hashed.split('$')
+        computed_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+        return computed_hash.hex() == password_hash
+    except:
+        return False
+
+
+def _create_token(user_id: int) -> str:
+    now = datetime.now(tz.utc)
+    payload = {
+        'user_id': user_id,
+        'exp': now + timedelta(hours=JWT_EXPIRY_HOURS),
+        'iat': now
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+
+
+def _verify_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
 
 
 async def _run_with_connection(operation):
@@ -89,31 +131,46 @@ async def init_db():
                 async with aiosqlite.connect(path) as c:
                     await c.execute("PRAGMA journal_mode=WAL")
                     await c.execute("""
+                        CREATE TABLE IF NOT EXISTS users(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            username TEXT UNIQUE NOT NULL,
+                            email TEXT UNIQUE,
+                            password_hash TEXT NOT NULL,
+                            created_at TEXT NOT NULL
+                        )
+                    """)
+                    await c.execute("""
                         CREATE TABLE IF NOT EXISTS expenses(
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            user_id INTEGER NOT NULL,
                             date TEXT NOT NULL,
                             amount REAL NOT NULL,
                             category TEXT NOT NULL,
                             subcategory TEXT DEFAULT '',
-                            note TEXT DEFAULT ''
+                            note TEXT DEFAULT '',
+                            FOREIGN KEY(user_id) REFERENCES users(id)
                         )
                     """)
                     await c.execute("""
                         CREATE TABLE IF NOT EXISTS credits(
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            user_id INTEGER NOT NULL,
                             date TEXT NOT NULL,
                             amount REAL NOT NULL,
                             source TEXT NOT NULL,
-                            note TEXT DEFAULT ''
+                            note TEXT DEFAULT '',
+                            FOREIGN KEY(user_id) REFERENCES users(id)
                         )
                     """)
                     await c.execute("""
                         CREATE TABLE IF NOT EXISTS shared_expenses(
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            user_id INTEGER NOT NULL,
                             date TEXT NOT NULL,
                             description TEXT,
                             total_amount REAL NOT NULL,
-                            paid_by TEXT NOT NULL
+                            paid_by TEXT NOT NULL,
+                            FOREIGN KEY(user_id) REFERENCES users(id)
                         )
                     """)
                     await c.execute("""
@@ -129,17 +186,22 @@ async def init_db():
                     await c.execute("""
                         CREATE TABLE IF NOT EXISTS friends(
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            name TEXT UNIQUE NOT NULL,
-                            email TEXT UNIQUE
+                            user_id INTEGER NOT NULL,
+                            name TEXT NOT NULL,
+                            email TEXT,
+                            FOREIGN KEY(user_id) REFERENCES users(id),
+                            UNIQUE(user_id, name)
                         )
                     """)
                     await c.execute("""
                         CREATE TABLE IF NOT EXISTS settlements(
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            user_id INTEGER NOT NULL,
                             person TEXT NOT NULL,
                             amount REAL NOT NULL,
                             settlement_date TEXT NOT NULL,
-                            note TEXT DEFAULT ''
+                            note TEXT DEFAULT '',
+                            FOREIGN KEY(user_id) REFERENCES users(id)
                         )
                     """)
                     await c.commit()
@@ -166,11 +228,11 @@ def _normalize_payer_name_sync(paid_by: str):
     return asyncio.run(_normalize_payer_name(paid_by))
 
 
-async def _calculate_balances(conn):
+async def _calculate_balances(conn, user_id: int):
     balances = {}
 
     expense_rows = await _execute_fetchall(
-        conn, "SELECT id, paid_by FROM shared_expenses"
+        conn, "SELECT id, paid_by FROM shared_expenses WHERE user_id=?", (user_id,)
     )
 
     for expense_id, paid_by in expense_rows:
@@ -199,7 +261,7 @@ async def _calculate_balances(conn):
             balances[payer_name] = balances.get(payer_name, 0.0) + round(others_total, 2)
 
     settlement_rows = await _execute_fetchall(
-        conn, "SELECT person, amount FROM settlements"
+        conn, "SELECT person, amount FROM settlements WHERE user_id=?", (user_id,)
     )
 
     for person, amount in settlement_rows:
@@ -359,13 +421,72 @@ async def _ensure_db_initialized():
         _db_initialized = True
 
 
+@mcp.tool(description="Register a new user with username and password.")
+async def register_user(username: str, password: str, email: str = ""):
+    async with db_lock:
+        async def _op(conn):
+            existing = await _execute_fetchone(conn, "SELECT id FROM users WHERE username=?", (username,))
+            if existing:
+                return {"status": "error", "message": "Username already exists"}
+
+            password_hash = _hash_password(password)
+            created_at = datetime.now(tz.utc).isoformat()
+
+            cur = await conn.execute(
+                "INSERT INTO users(username, email, password_hash, created_at) VALUES (?,?,?,?)",
+                (username, email, password_hash, created_at)
+            )
+            await conn.commit()
+            return {"status": "ok", "user_id": cur.lastrowid, "message": "User registered successfully"}
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Login with username and password to get a JWT token.")
+async def login(username: str, password: str):
+    async def _op(conn):
+        user = await _execute_fetchone(conn, "SELECT id, password_hash FROM users WHERE username=?", (username,))
+        if not user:
+            return {"status": "error", "message": "Invalid username or password"}
+
+        user_id, password_hash = user
+        if not _verify_password(password, password_hash):
+            return {"status": "error", "message": "Invalid username or password"}
+
+        token = _create_token(user_id)
+        return {"status": "ok", "token": token, "user_id": user_id, "message": "Login successful"}
+
+    return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Verify a JWT token and return user information.")
+async def verify_token(token: str):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async def _op(conn):
+        user = await _execute_fetchone(conn, "SELECT id, username, email FROM users WHERE id=?", (payload['user_id'],))
+        if not user:
+            return {"status": "error", "message": "User not found"}
+
+        user_id, username, email = user
+        return {"status": "ok", "user_id": user_id, "username": username, "email": email}
+
+    return await _run_with_connection(_op)
+
+
 @mcp.tool(description="Add a new regular expense entry to the database.")
-async def add_expense(date, amount, category, subcategory="", note=""):
+async def add_expense(token: str, date, amount, category, subcategory="", note=""):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async with db_lock:
         async def _op(conn):
             cur = await conn.execute(
-                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-                (date, amount, category, subcategory, note)
+                "INSERT INTO expenses(user_id, date, amount, category, subcategory, note) VALUES (?,?,?,?,?,?)",
+                (payload['user_id'], date, amount, category, subcategory, note)
             )
             await conn.commit()
             return {"status": "ok", "id": cur.lastrowid}
@@ -374,16 +495,20 @@ async def add_expense(date, amount, category, subcategory="", note=""):
 
 
 @mcp.tool(description="List expense entries within an inclusive date range.")
-async def list_expenses(start_date, end_date):
+async def list_expenses(token: str, start_date, end_date):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async def _op(conn):
         cur = await conn.execute(
             """
             SELECT id, date, amount, category, subcategory, note
             FROM expenses
-            WHERE date BETWEEN ? AND ?
+            WHERE user_id=? AND date BETWEEN ? AND ?
             ORDER BY id ASC
             """,
-            (start_date, end_date)
+            (payload['user_id'], start_date, end_date)
         )
         cols = [d[0] for d in cur.description]
         rows = await cur.fetchall()
@@ -393,14 +518,18 @@ async def list_expenses(start_date, end_date):
 
 
 @mcp.tool(description="Summarize expenses by category within an inclusive date range.")
-async def summarize(start_date, end_date, category=None):
+async def summarize(token: str, start_date, end_date, category=None):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async def _op(conn):
         query = """
             SELECT category, SUM(amount) AS total_amount
             FROM expenses
-            WHERE date BETWEEN ? AND ?
+            WHERE user_id=? AND date BETWEEN ? AND ?
         """
-        params = [start_date, end_date]
+        params = [payload['user_id'], start_date, end_date]
 
         if category:
             query += " AND category = ?"
@@ -417,21 +546,23 @@ async def summarize(start_date, end_date, category=None):
 
 
 @mcp.tool(description="Delete an expense using its known details instead of an ID.")
-async def delete_expense(date: str, amount: float, category: str, subcategory: str = None):
+async def delete_expense(token: str, date: str, amount: float, category: str, subcategory: str = None):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async def _op(conn):
         query = """
         SELECT id, date, amount, category, subcategory, note
         FROM expenses
-        WHERE date=? AND amount=? AND category=?
+        WHERE user_id=? AND date=? AND amount=? AND category=?
         """
 
-        params = [date, amount, category]
+        params = [payload['user_id'], date, amount, category]
 
         if subcategory:
             query += " AND subcategory=?"
             params.append(subcategory)
-
-        rows = await _execute_fetchall(conn, query, params)
 
         if len(rows) == 0:
             return {"status": "error", "message": "No matching expense found"}
@@ -461,16 +592,20 @@ async def delete_expense(date: str, amount: float, category: str, subcategory: s
 
 
 @mcp.tool(description="Edit an existing expense using known details.")
-async def edit_expense(old_date: str, old_amount: float, old_category: str, new_date: str = None, new_amount: float = None, new_category: str = None, new_subcategory: str = None, new_note: str = None):
+async def edit_expense(token: str, old_date: str, old_amount: float, old_category: str, new_date: str = None, new_amount: float = None, new_category: str = None, new_subcategory: str = None, new_note: str = None):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async def _op(conn):
         rows = await _execute_fetchall(
             conn,
             """
             SELECT id, date, amount, category, subcategory, note
             FROM expenses
-            WHERE date=? AND amount=? AND category=?
+            WHERE user_id=? AND date=? AND amount=? AND category=?
             """,
-            (old_date, old_amount, old_category)
+            (payload['user_id'], old_date, old_amount, old_category)
         )
 
         if len(rows) == 0:
@@ -519,15 +654,19 @@ async def edit_expense(old_date: str, old_amount: float, old_category: str, new_
 
 
 @mcp.tool(description="Record incoming money such as salary, reimbursement, cashback, refund, or bonus.")
-async def add_credit(date: str, amount: float, source: str, note: str = ""):
+async def add_credit(token: str, date: str, amount: float, source: str, note: str = ""):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async with db_lock:
         async def _op(conn):
             cur = await conn.execute(
                 """
-                INSERT INTO credits(date, amount, source, note)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO credits(user_id, date, amount, source, note)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (date, amount, source, note)
+                (payload['user_id'], date, amount, source, note)
             )
             await conn.commit()
             return {"status": "ok", "credit_id": cur.lastrowid, "message": "Credit added successfully"}
@@ -536,16 +675,20 @@ async def add_credit(date: str, amount: float, source: str, note: str = ""):
 
 
 @mcp.tool(description="List all credited amounts within a date range.")
-async def list_credits(start_date: str, end_date: str):
+async def list_credits(token: str, start_date: str, end_date: str):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async def _op(conn):
         cur = await conn.execute(
             """
             SELECT id, date, amount, source, note
             FROM credits
-            WHERE date BETWEEN ? AND ?
+            WHERE user_id=? AND date BETWEEN ? AND ?
             ORDER BY date ASC
             """,
-            (start_date, end_date)
+            (payload['user_id'], start_date, end_date)
         )
         cols = [d[0] for d in cur.description]
         rows = await cur.fetchall()
@@ -555,10 +698,14 @@ async def list_credits(start_date: str, end_date: str):
 
 
 @mcp.tool(description="Add a friend to the expense tracker so shared-expense emails can be sent to them.")
-async def add_friend(name: str, email: str):
+async def add_friend(token: str, name: str, email: str):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async with db_lock:
         async def _op(conn):
-            await conn.execute("INSERT INTO friends(name,email) VALUES (?,?)", (name, email))
+            await conn.execute("INSERT INTO friends(user_id,name,email) VALUES (?,?,?)", (payload['user_id'], name, email))
             await conn.commit()
             return {"status": "ok", "message": f"{name} added"}
 
@@ -566,13 +713,17 @@ async def add_friend(name: str, email: str):
 
 
 @mcp.tool(description="Update the email address for an existing friend.")
-async def update_friend_email(name: str, new_email: str):
+async def update_friend_email(token: str, name: str, new_email: str):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async with db_lock:
         async def _op(conn):
-            row = await _execute_fetchone(conn, "SELECT id FROM friends WHERE LOWER(name)=LOWER(?)", (name,))
+            row = await _execute_fetchone(conn, "SELECT id FROM friends WHERE user_id=? AND LOWER(name)=LOWER(?)", (payload['user_id'], name))
             if not row:
                 return {"status": "error", "message": f"Friend '{name}' not found"}
-            await conn.execute("UPDATE friends SET email=? WHERE LOWER(name)=LOWER(?)", (new_email, name))
+            await conn.execute("UPDATE friends SET email=? WHERE user_id=? AND LOWER(name)=LOWER(?)", (new_email, payload['user_id'], name))
             await conn.commit()
             return {"status": "ok", "message": f"Email updated for {name}"}
 
@@ -580,9 +731,13 @@ async def update_friend_email(name: str, new_email: str):
 
 
 @mcp.tool(description="List the friends that are currently registered in the tracker.")
-async def list_friends():
+async def list_friends(token: str):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async def _op(conn):
-        cur = await conn.execute("SELECT id,name,email FROM friends")
+        cur = await conn.execute("SELECT id,name,email FROM friends WHERE user_id=?", (payload['user_id'],))
         cols = [d[0] for d in cur.description]
         rows = await cur.fetchall()
         return [dict(zip(cols, row)) for row in rows]
@@ -591,7 +746,11 @@ async def list_friends():
 
 
 @mcp.tool(description="Create a shared expense and split it among participants, including optional email notifications.")
-async def add_shared_expense(date: str, amount: float, paid_by: str, participants: list, description: str = ""):
+async def add_shared_expense(token: str, date: str, amount: float, paid_by: str, participants: list, description: str = ""):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     participant_splits = await _build_participant_splits(amount, participants, paid_by)
     payer_name = await _normalize_payer_name(paid_by)
 
@@ -601,10 +760,10 @@ async def add_shared_expense(date: str, amount: float, paid_by: str, participant
         async def _op(conn):
             cur = await conn.execute(
                 """
-                INSERT INTO shared_expenses(date, description, total_amount, paid_by)
-                VALUES (?,?,?,?)
+                INSERT INTO shared_expenses(user_id, date, description, total_amount, paid_by)
+                VALUES (?,?,?,?,?)
                 """,
-                (date, description, amount, payer_name)
+                (payload['user_id'], date, description, amount, payer_name)
             )
             expense_id = cur.lastrowid
 
@@ -617,13 +776,13 @@ async def add_shared_expense(date: str, amount: float, paid_by: str, participant
                     (expense_id, entry["name"], entry["share"])
                 )
 
-            balances = await _calculate_balances(conn)
+            balances = await _calculate_balances(conn, payload['user_id'])
 
             for entry in participant_splits:
                 person = entry["name"]
                 email_row = await _execute_fetchone(
-                    conn, "SELECT email FROM friends WHERE LOWER(name)=LOWER(?)",
-                    (person,)
+                    conn, "SELECT email FROM friends WHERE user_id=? AND LOWER(name)=LOWER(?)",
+                    (payload['user_id'], person)
                 )
 
                 if email_row and email_row[0]:
@@ -642,20 +801,24 @@ async def add_shared_expense(date: str, amount: float, paid_by: str, participant
 
 
 @mcp.tool(description="Record a settlement payment and notify the involved parties.")
-async def settle_payment(person: str, amount: float, settlement_date: str, note: str = ""):
+async def settle_payment(token: str, person: str, amount: float, settlement_date: str, note: str = ""):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     email_tasks = []
 
     async with db_lock:
         async def _op(conn):
             await conn.execute(
                 """
-                INSERT INTO settlements(person, amount, settlement_date, note)
-                VALUES (?,?,?,?)
+                INSERT INTO settlements(user_id, person, amount, settlement_date, note)
+                VALUES (?,?,?,?,?)
                 """,
-                (person, amount, settlement_date, note)
+                (payload['user_id'], person, amount, settlement_date, note)
             )
 
-            friend_row = await _execute_fetchone(conn, "SELECT email FROM friends WHERE LOWER(name)=LOWER(?)", (person,))
+            friend_row = await _execute_fetchone(conn, "SELECT email FROM friends WHERE user_id=? AND LOWER(name)=LOWER(?)", (payload['user_id'], person))
             if friend_row and friend_row[0]:
                 email_tasks.append(send_email(friend_row[0], "Settlement recorded", f"Hi {person},\n\nA settlement of ₹{amount:.2f} was recorded on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"))
 
@@ -674,9 +837,13 @@ async def settle_payment(person: str, amount: float, settlement_date: str, note:
 
 
 @mcp.tool(description="Calculate the net balance for each person from shared expenses and settlements.")
-async def get_balances():
+async def get_balances(token: str):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
     async def _op(conn):
-        return await _calculate_balances(conn)
+        return await _calculate_balances(conn, payload['user_id'])
 
     return await _run_with_connection(_op)
 
