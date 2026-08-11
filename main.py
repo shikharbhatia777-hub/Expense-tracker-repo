@@ -260,6 +260,28 @@ async def _calculate_balances(conn, user_id: int):
         if payer_name:
             balances[payer_name] = balances.get(payer_name, 0.0) + round(others_total, 2)
 
+    # Get user's name from username for participant lookup
+    user_row = await _execute_fetchone(conn, "SELECT username FROM users WHERE id=?", (user_id,))
+    username = user_row[0] if user_row else None
+
+    # Include expenses where this user is a participant
+    if username:
+        participant_expenses = await _execute_fetchall(
+            conn, """
+            SELECT se.id, se.paid_by, sep.share_amount
+            FROM shared_expense_participants sep
+            JOIN shared_expenses se ON sep.expense_id = se.id
+            WHERE LOWER(sep.participant) = LOWER(?)
+            """, (username,)
+        )
+
+        for expense_id, paid_by, share_amount in participant_expenses:
+            payer_name = await _normalize_payer_name(paid_by)
+            share_value = round(float(share_amount), 2)
+
+            if username.lower() != payer_name.lower():
+                balances[payer_name] = balances.get(payer_name, 0.0) + share_value
+
     settlement_rows = await _execute_fetchall(
         conn, "SELECT person, amount FROM settlements WHERE user_id=?", (user_id,)
     )
@@ -739,10 +761,55 @@ async def list_friends(token: str):
         return {"status": "error", "message": "Invalid or expired token"}
 
     async def _op(conn):
-        cur = await conn.execute("SELECT id,name,email FROM friends WHERE user_id=?", (payload['user_id'],))
-        cols = [d[0] for d in cur.description]
-        rows = await cur.fetchall()
-        return [dict(zip(cols, row)) for row in rows]
+        # Get current user info
+        user_row = await _execute_fetchone(conn, "SELECT email, username FROM users WHERE id=?", (payload['user_id'],))
+        if not user_row:
+            return []
+
+        user_email, username = user_row
+
+        # Get explicit friends (added by this user)
+        explicit_rows = await _execute_fetchall(
+            conn,
+            "SELECT id, name, email FROM friends WHERE user_id=?",
+            (payload['user_id'],)
+        )
+        explicit_friends = [{'id': r[0], 'name': r[1], 'email': r[2]} for r in explicit_rows]
+
+        # Get implicit friends (people who added this user as a friend)
+        # Find all friend entries where the email or name matches this user
+        implicit_rows = await _execute_fetchall(
+            conn, """
+            SELECT DISTINCT f.user_id FROM friends f
+            WHERE (
+                (f.email IS NOT NULL AND LOWER(f.email) = LOWER(?))
+                OR (f.name IS NOT NULL AND LOWER(f.name) = LOWER(?))
+            )
+            AND f.user_id != ?
+            """,
+            (user_email or '', username, payload['user_id'])
+        )
+
+        implicit_friends = []
+        seen_emails = {f['email'] for f in explicit_friends if f['email']}
+
+        for (adder_user_id,) in implicit_rows:
+            adder_row = await _execute_fetchone(
+                conn,
+                "SELECT username, email FROM users WHERE id=?",
+                (adder_user_id,)
+            )
+            if adder_row:
+                adder_username, adder_email = adder_row
+                if adder_email and adder_email not in seen_emails:
+                    implicit_friends.append({
+                        'id': None,
+                        'name': adder_username,
+                        'email': adder_email
+                    })
+                    seen_emails.add(adder_email)
+
+        return explicit_friends + implicit_friends
 
     return await _run_with_connection(_op)
 
