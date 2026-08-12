@@ -6,6 +6,8 @@ import aiofiles
 import jwt
 import hashlib
 import secrets
+import queue
+import threading
 from datetime import datetime, timedelta, timezone as tz
 
 try:
@@ -40,7 +42,7 @@ db_lock = asyncio.Lock()
 _db_initialized = False
 _current_user_id = None
 _db_pool = None
-_email_queue = asyncio.Queue()
+_email_queue = queue.Queue()
 _email_worker_task = None
 
 
@@ -425,21 +427,25 @@ async def send_email(recipient, subject, body):
 def queue_email(recipient, subject, body):
     try:
         print(f"[QUEUE] 📬 Queuing email to {recipient}")
-        _email_queue.put_nowait((recipient, subject, body))
+        _email_queue.put((recipient, subject, body), block=False)
         print(f"[QUEUE] ✅ Email queued (Queue size: {_email_queue.qsize()})")
-    except asyncio.QueueFull:
+    except queue.Full:
         print(f"[QUEUE] ❌ Queue full, dropping email to {recipient}")
     except Exception as e:
         print(f"[QUEUE] ❌ Error: {e}")
 
 
-async def _email_worker():
+def run_email_worker():
     print("[WORKER] 🚀 Email worker started")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     while True:
         try:
-            recipient, subject, body = await _email_queue.get()
+            recipient, subject, body = _email_queue.get(timeout=1)
             print(f"[WORKER] 📨 Processing email to {recipient}")
-            await send_email(recipient, subject, body)
+            loop.run_until_complete(send_email(recipient, subject, body))
+        except queue.Empty:
+            continue
         except Exception as e:
             print(f"[WORKER] ❌ Error: {e}")
             import traceback
@@ -455,13 +461,6 @@ async def _ensure_db_initialized():
     # Start email worker if not already running
     if _email_worker_task is None:
         print("[INIT] 🚀 Starting email worker thread...")
-        import threading
-        def run_email_worker():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            print("[WORKER] 🚀 Email worker thread started")
-            loop.run_until_complete(_email_worker())
-
         _email_worker_task = threading.Thread(target=run_email_worker, daemon=True)
         _email_worker_task.start()
         print("[INIT] ✅ Email worker thread created")
@@ -1002,14 +1001,4 @@ async def categories():
 
 
 if __name__ == "__main__":
-    import threading
-
-    def run_email_worker():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_email_worker())
-
-    worker_thread = threading.Thread(target=run_email_worker, daemon=True)
-    worker_thread.start()
-
     mcp.run(transport="http", host="0.0.0.0", port=8000)
