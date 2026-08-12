@@ -447,10 +447,24 @@ async def _email_worker():
 
 
 async def _ensure_db_initialized():
-    global _db_initialized
+    global _db_initialized, _email_worker_task
     if not _db_initialized:
         await init_db()
         _db_initialized = True
+
+    # Start email worker if not already running
+    if _email_worker_task is None:
+        print("[INIT] 🚀 Starting email worker thread...")
+        import threading
+        def run_email_worker():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            print("[WORKER] 🚀 Email worker thread started")
+            loop.run_until_complete(_email_worker())
+
+        _email_worker_task = threading.Thread(target=run_email_worker, daemon=True)
+        _email_worker_task.start()
+        print("[INIT] ✅ Email worker thread created")
 
 
 @mcp.tool(description="Register a new user with username and password.")
