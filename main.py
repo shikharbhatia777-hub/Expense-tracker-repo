@@ -893,6 +893,18 @@ async def add_shared_expense(token: str, date: str, amount: float, paid_by: str,
                 else:
                     print(f"[EXPENSE] ⚠️  No email found for {person}")
 
+            # Send email to the payer (current user) as well
+            user_row = await _execute_fetchone(
+                conn, "SELECT email FROM users WHERE id=$1",
+                (payload['user_id'],)
+            )
+            if user_row and user_row['email']:
+                print(f"[EXPENSE] 📧 Found payer email: {user_row['email']}")
+                email_summary = await _build_email_summary(paid_by, amount, description, participant_splits, balances, "You")
+                queue_email(user_row['email'], f"Expense Split: {description}", email_summary)
+            else:
+                print(f"[EXPENSE] ⚠️  No email found for payer")
+
             return {"status": "ok", "expense_id": expense_id, "splits": participant_splits}
 
         result = await _run_with_connection(_op)
