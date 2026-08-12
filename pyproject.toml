@@ -11,4 +11,5 @@ dependencies = [
     "aiofiles>=23.2.1",
     "aiosmtplib>=3.0.1",
     "PyJWT>=2.8.0",
+    "asyncpg>=0.31.0",
 ]

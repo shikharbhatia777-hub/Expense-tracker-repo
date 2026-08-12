@@ -1,7 +1,7 @@
 from fastmcp import FastMCP
 import asyncio
 import os
-import aiosqlite
+import asyncpg
 import aiofiles
 from email.mime.text import MIMEText
 import jwt
@@ -19,36 +19,14 @@ try:
 except ImportError:  # pragma: no cover
     load_dotenv = None
 
-
-def _resolve_writable_path(filename: str, env_var: str):
-    explicit_path = os.getenv(env_var)
-    if explicit_path:
-        return explicit_path
-
-    preferred_paths = [
-        os.path.join(os.getcwd(), filename),
-        os.path.join(os.getcwd(), "data", filename),
-        os.path.join("/tmp", "expense_tracker", filename),
-    ]
-
-    for path in preferred_paths:
-        try:
-            parent_dir = os.path.dirname(path) or "."
-            os.makedirs(parent_dir, exist_ok=True)
-            if os.access(parent_dir, os.W_OK):
-                return path
-        except Exception:
-            continue
-
-    return os.path.join(os.getcwd(), filename)
-
-
-DB_PATH = _resolve_writable_path("expenses.db", "DB_PATH")
-CATEGORIES_PATH = _resolve_writable_path("categories.json", "CATEGORIES_PATH")
-ENV_PATH = _resolve_writable_path(".env", "ENV_PATH")
-
 if load_dotenv is not None:
-    load_dotenv(ENV_PATH)
+    load_dotenv()
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "postgres")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -63,6 +41,7 @@ mcp = FastMCP("ExpenseTracker")
 db_lock = asyncio.Lock()
 _db_initialized = False
 _current_user_id = None
+_db_pool = None
 
 
 def _hash_password(password: str) -> str:
@@ -99,120 +78,121 @@ def _verify_token(token: str) -> dict:
         return None
 
 
+async def _get_connection():
+    global _db_pool
+    if _db_pool is None:
+        raise RuntimeError("Database pool not initialized")
+    return _db_pool
+
 async def _run_with_connection(operation):
     await _ensure_db_initialized()
-    async with aiosqlite.connect(DB_PATH) as conn:
-        return await operation(conn)
+    conn = await _get_connection()
+    return await operation(conn)
 
 
 async def _execute_fetchall(conn, query, params=()):
-    cursor = await conn.execute(query, params)
-    return await cursor.fetchall()
+    return await conn.fetch(query, *params)
 
 
 async def _execute_fetchone(conn, query, params=()):
-    cursor = await conn.execute(query, params)
-    return await cursor.fetchone()
+    return await conn.fetchrow(query, *params)
 
 
 async def init_db():
-    global DB_PATH
+    global _db_pool
 
-    candidate_paths = [DB_PATH]
-    if DB_PATH != os.path.join("/tmp", "expense_tracker", "expenses.db"):
-        candidate_paths.append(os.path.join("/tmp", "expense_tracker", "expenses.db"))
+    try:
+        _db_pool = await asyncpg.create_pool(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            database=POSTGRES_DB,
+            min_size=5,
+            max_size=20,
+        )
 
-    last_error = None
-    for path in candidate_paths:
+        conn = await _db_pool.acquire()
         try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users(
+                    id SERIAL PRIMARY KEY,
+                    username TEXT UNIQUE NOT NULL,
+                    email TEXT UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS expenses(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    subcategory TEXT DEFAULT '',
+                    note TEXT DEFAULT '',
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS credits(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    note TEXT DEFAULT '',
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS shared_expenses(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    description TEXT,
+                    total_amount REAL NOT NULL,
+                    paid_by TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS shared_expense_participants(
+                    id SERIAL PRIMARY KEY,
+                    expense_id INTEGER NOT NULL,
+                    participant TEXT NOT NULL,
+                    share_amount REAL NOT NULL,
+                    FOREIGN KEY(expense_id)
+                    REFERENCES shared_expenses(id)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS friends(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    email TEXT,
+                    FOREIGN KEY(user_id) REFERENCES users(id),
+                    UNIQUE(user_id, name)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS settlements(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    person TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    settlement_date TEXT NOT NULL,
+                    note TEXT DEFAULT '',
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            """)
+        finally:
+            await _db_pool.release(conn)
 
-            async def _setup():
-                async with aiosqlite.connect(path) as c:
-                    await c.execute("PRAGMA journal_mode=WAL")
-                    await c.execute("""
-                        CREATE TABLE IF NOT EXISTS users(
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            username TEXT UNIQUE NOT NULL,
-                            email TEXT UNIQUE,
-                            password_hash TEXT NOT NULL,
-                            created_at TEXT NOT NULL
-                        )
-                    """)
-                    await c.execute("""
-                        CREATE TABLE IF NOT EXISTS expenses(
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL,
-                            date TEXT NOT NULL,
-                            amount REAL NOT NULL,
-                            category TEXT NOT NULL,
-                            subcategory TEXT DEFAULT '',
-                            note TEXT DEFAULT '',
-                            FOREIGN KEY(user_id) REFERENCES users(id)
-                        )
-                    """)
-                    await c.execute("""
-                        CREATE TABLE IF NOT EXISTS credits(
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL,
-                            date TEXT NOT NULL,
-                            amount REAL NOT NULL,
-                            source TEXT NOT NULL,
-                            note TEXT DEFAULT '',
-                            FOREIGN KEY(user_id) REFERENCES users(id)
-                        )
-                    """)
-                    await c.execute("""
-                        CREATE TABLE IF NOT EXISTS shared_expenses(
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL,
-                            date TEXT NOT NULL,
-                            description TEXT,
-                            total_amount REAL NOT NULL,
-                            paid_by TEXT NOT NULL,
-                            FOREIGN KEY(user_id) REFERENCES users(id)
-                        )
-                    """)
-                    await c.execute("""
-                        CREATE TABLE IF NOT EXISTS shared_expense_participants(
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            expense_id INTEGER NOT NULL,
-                            participant TEXT NOT NULL,
-                            share_amount REAL NOT NULL,
-                            FOREIGN KEY(expense_id)
-                            REFERENCES shared_expenses(id)
-                        )
-                    """)
-                    await c.execute("""
-                        CREATE TABLE IF NOT EXISTS friends(
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL,
-                            name TEXT NOT NULL,
-                            email TEXT,
-                            FOREIGN KEY(user_id) REFERENCES users(id),
-                            UNIQUE(user_id, name)
-                        )
-                    """)
-                    await c.execute("""
-                        CREATE TABLE IF NOT EXISTS settlements(
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER NOT NULL,
-                            person TEXT NOT NULL,
-                            amount REAL NOT NULL,
-                            settlement_date TEXT NOT NULL,
-                            note TEXT DEFAULT '',
-                            FOREIGN KEY(user_id) REFERENCES users(id)
-                        )
-                    """)
-                    await c.commit()
-
-            await _setup()
-            DB_PATH = path
-            return
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(f"Unable to initialize database: {last_error}")
+    except Exception as e:
+        raise RuntimeError(f"Unable to initialize database: {e}")
 
 
 async def _normalize_payer_name(paid_by: str):
@@ -232,12 +212,13 @@ async def _calculate_balances(conn, user_id: int):
     balances = {}
 
     expense_rows = await _execute_fetchall(
-        conn, "SELECT id, paid_by FROM shared_expenses WHERE user_id=?", (user_id,)
+        conn, "SELECT id, paid_by FROM shared_expenses WHERE user_id=$1", (user_id,)
     )
 
-    for expense_id, paid_by in expense_rows:
+    for expense_row in expense_rows:
+        expense_id, paid_by = expense_row['id'], expense_row['paid_by']
         participant_rows = await _execute_fetchall(
-            conn, "SELECT participant, share_amount FROM shared_expense_participants WHERE expense_id=?",
+            conn, "SELECT participant, share_amount FROM shared_expense_participants WHERE expense_id=$1",
             (expense_id,)
         )
 
@@ -247,7 +228,8 @@ async def _calculate_balances(conn, user_id: int):
         payer_name = await _normalize_payer_name(paid_by)
         others_total = 0.0
 
-        for participant, share_amount in participant_rows:
+        for participant_row in participant_rows:
+            participant, share_amount = participant_row['participant'], participant_row['share_amount']
             participant_name = await _normalize_payer_name(participant)
             share_value = round(float(share_amount), 2)
 
@@ -261,8 +243,8 @@ async def _calculate_balances(conn, user_id: int):
             balances[payer_name] = balances.get(payer_name, 0.0) + round(others_total, 2)
 
     # Get user's name from username for participant lookup
-    user_row = await _execute_fetchone(conn, "SELECT username FROM users WHERE id=?", (user_id,))
-    username = user_row[0] if user_row else None
+    user_row = await _execute_fetchone(conn, "SELECT username FROM users WHERE id=$1", (user_id,))
+    username = user_row['username'] if user_row else None
 
     # Include expenses where this user is a participant
     if username:
@@ -271,11 +253,12 @@ async def _calculate_balances(conn, user_id: int):
             SELECT se.id, se.paid_by, sep.share_amount
             FROM shared_expense_participants sep
             JOIN shared_expenses se ON sep.expense_id = se.id
-            WHERE LOWER(sep.participant) = LOWER(?)
+            WHERE LOWER(sep.participant) = LOWER($1)
             """, (username,)
         )
 
-        for expense_id, paid_by, share_amount in participant_expenses:
+        for expense_row in participant_expenses:
+            paid_by, share_amount = expense_row['paid_by'], expense_row['share_amount']
             payer_name = await _normalize_payer_name(paid_by)
             share_value = round(float(share_amount), 2)
 
@@ -283,10 +266,11 @@ async def _calculate_balances(conn, user_id: int):
                 balances[payer_name] = balances.get(payer_name, 0.0) + share_value
 
     settlement_rows = await _execute_fetchall(
-        conn, "SELECT person, amount FROM settlements WHERE user_id=?", (user_id,)
+        conn, "SELECT person, amount FROM settlements WHERE user_id=$1", (user_id,)
     )
 
-    for person, amount in settlement_rows:
+    for settlement_row in settlement_rows:
+        person, amount = settlement_row['person'], settlement_row['amount']
         person_name = await _normalize_payer_name(person)
         amount_value = round(float(amount), 2)
         current_balance = balances.get(person_name, 0.0)
@@ -447,19 +431,18 @@ async def _ensure_db_initialized():
 async def register_user(username: str, password: str, email: str = ""):
     async with db_lock:
         async def _op(conn):
-            existing = await _execute_fetchone(conn, "SELECT id FROM users WHERE username=?", (username,))
+            existing = await _execute_fetchone(conn, "SELECT id FROM users WHERE username=$1", (username,))
             if existing:
                 return {"status": "error", "message": "Username already exists"}
 
             password_hash = _hash_password(password)
             created_at = datetime.now(tz.utc).isoformat()
 
-            cur = await conn.execute(
-                "INSERT INTO users(username, email, password_hash, created_at) VALUES (?,?,?,?)",
-                (username, email, password_hash, created_at)
+            user_id = await conn.fetchval(
+                "INSERT INTO users(username, email, password_hash, created_at) VALUES ($1,$2,$3,$4) RETURNING id",
+                username, email, password_hash, created_at
             )
-            await conn.commit()
-            return {"status": "ok", "user_id": cur.lastrowid, "message": "User registered successfully"}
+            return {"status": "ok", "user_id": user_id, "message": "User registered successfully"}
 
         return await _run_with_connection(_op)
 
@@ -467,11 +450,11 @@ async def register_user(username: str, password: str, email: str = ""):
 @mcp.tool(description="Login with username and password to get a JWT token.")
 async def login(username: str, password: str):
     async def _op(conn):
-        user = await _execute_fetchone(conn, "SELECT id, password_hash FROM users WHERE username=?", (username,))
+        user = await _execute_fetchone(conn, "SELECT id, password_hash FROM users WHERE username=$1", (username,))
         if not user:
             return {"status": "error", "message": "Invalid username or password"}
 
-        user_id, password_hash = user
+        user_id, password_hash = user['id'], user['password_hash']
         if not _verify_password(password, password_hash):
             return {"status": "error", "message": "Invalid username or password"}
 
@@ -488,12 +471,11 @@ async def verify_token(token: str):
         return {"status": "error", "message": "Invalid or expired token"}
 
     async def _op(conn):
-        user = await _execute_fetchone(conn, "SELECT id, username, email FROM users WHERE id=?", (payload['user_id'],))
+        user = await _execute_fetchone(conn, "SELECT id, username, email FROM users WHERE id=$1", (payload['user_id'],))
         if not user:
             return {"status": "error", "message": "User not found"}
 
-        user_id, username, email = user
-        return {"status": "ok", "user_id": user_id, "username": username, "email": email}
+        return {"status": "ok", "user_id": user['id'], "username": user['username'], "email": user['email']}
 
     return await _run_with_connection(_op)
 
@@ -506,12 +488,11 @@ async def add_expense(token: str, date, amount, category, subcategory="", note="
 
     async with db_lock:
         async def _op(conn):
-            cur = await conn.execute(
-                "INSERT INTO expenses(user_id, date, amount, category, subcategory, note) VALUES (?,?,?,?,?,?)",
-                (payload['user_id'], date, amount, category, subcategory, note)
+            expense_id = await conn.fetchval(
+                "INSERT INTO expenses(user_id, date, amount, category, subcategory, note) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+                payload['user_id'], date, amount, category, subcategory, note
             )
-            await conn.commit()
-            return {"status": "ok", "id": cur.lastrowid}
+            return {"status": "ok", "id": expense_id}
 
         return await _run_with_connection(_op)
 
@@ -523,18 +504,17 @@ async def list_expenses(token: str, start_date, end_date):
         return {"status": "error", "message": "Invalid or expired token"}
 
     async def _op(conn):
-        cur = await conn.execute(
+        rows = await _execute_fetchall(
+            conn,
             """
             SELECT id, date, amount, category, subcategory, note
             FROM expenses
-            WHERE user_id=? AND date BETWEEN ? AND ?
+            WHERE user_id=$1 AND date BETWEEN $2 AND $3
             ORDER BY id ASC
             """,
             (payload['user_id'], start_date, end_date)
         )
-        cols = [d[0] for d in cur.description]
-        rows = await cur.fetchall()
-        return [dict(zip(cols, r)) for r in rows]
+        return [dict(r) for r in rows]
 
     return await _run_with_connection(_op)
 
@@ -546,23 +526,29 @@ async def summarize(token: str, start_date, end_date, category=None):
         return {"status": "error", "message": "Invalid or expired token"}
 
     async def _op(conn):
-        query = """
-            SELECT category, SUM(amount) AS total_amount
-            FROM expenses
-            WHERE user_id=? AND date BETWEEN ? AND ?
-        """
-        params = [payload['user_id'], start_date, end_date]
-
         if category:
-            query += " AND category = ?"
-            params.append(category)
-
-        query += " GROUP BY category ORDER BY category ASC"
-
-        cur = await conn.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        rows = await cur.fetchall()
-        return [dict(zip(cols, r)) for r in rows]
+            rows = await _execute_fetchall(
+                conn,
+                """
+                SELECT category, SUM(amount) AS total_amount
+                FROM expenses
+                WHERE user_id=$1 AND date BETWEEN $2 AND $3 AND category = $4
+                GROUP BY category ORDER BY category ASC
+                """,
+                (payload['user_id'], start_date, end_date, category)
+            )
+        else:
+            rows = await _execute_fetchall(
+                conn,
+                """
+                SELECT category, SUM(amount) AS total_amount
+                FROM expenses
+                WHERE user_id=$1 AND date BETWEEN $2 AND $3
+                GROUP BY category ORDER BY category ASC
+                """,
+                (payload['user_id'], start_date, end_date)
+            )
+        return [dict(r) for r in rows]
 
     return await _run_with_connection(_op)
 
@@ -574,19 +560,26 @@ async def delete_expense(token: str, date: str, amount: float, category: str, su
         return {"status": "error", "message": "Invalid or expired token"}
 
     async def _op(conn):
-        query = """
-        SELECT id, date, amount, category, subcategory, note
-        FROM expenses
-        WHERE user_id=? AND date=? AND amount=? AND category=?
-        """
-
-        params = [payload['user_id'], date, amount, category]
-
         if subcategory:
-            query += " AND subcategory=?"
-            params.append(subcategory)
-
-        rows = await _execute_fetchall(conn, query, params)
+            rows = await _execute_fetchall(
+                conn,
+                """
+                SELECT id, date, amount, category, subcategory, note
+                FROM expenses
+                WHERE user_id=$1 AND date=$2 AND amount=$3 AND category=$4 AND subcategory=$5
+                """,
+                (payload['user_id'], date, amount, category, subcategory)
+            )
+        else:
+            rows = await _execute_fetchall(
+                conn,
+                """
+                SELECT id, date, amount, category, subcategory, note
+                FROM expenses
+                WHERE user_id=$1 AND date=$2 AND amount=$3 AND category=$4
+                """,
+                (payload['user_id'], date, amount, category)
+            )
 
         if len(rows) == 0:
             return {"status": "error", "message": "No matching expense found"}
@@ -596,20 +589,19 @@ async def delete_expense(token: str, date: str, amount: float, category: str, su
                 "status": "multiple_matches",
                 "matches": [
                     {
-                        "id": r[0],
-                        "date": r[1],
-                        "amount": r[2],
-                        "category": r[3],
-                        "subcategory": r[4],
-                        "note": r[5]
+                        "id": r['id'],
+                        "date": r['date'],
+                        "amount": r['amount'],
+                        "category": r['category'],
+                        "subcategory": r['subcategory'],
+                        "note": r['note']
                     }
                     for r in rows
                 ]
             }
 
-        expense_id = rows[0][0]
-        await conn.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
-        await conn.commit()
+        expense_id = rows[0]['id']
+        await conn.execute("DELETE FROM expenses WHERE id=$1", expense_id)
         return {"status": "ok", "deleted_id": expense_id}
 
     return await _run_with_connection(_op)
@@ -627,7 +619,7 @@ async def edit_expense(token: str, old_date: str, old_amount: float, old_categor
             """
             SELECT id, date, amount, category, subcategory, note
             FROM expenses
-            WHERE user_id=? AND date=? AND amount=? AND category=?
+            WHERE user_id=$1 AND date=$2 AND amount=$3 AND category=$4
             """,
             (payload['user_id'], old_date, old_amount, old_category)
         )
@@ -640,12 +632,12 @@ async def edit_expense(token: str, old_date: str, old_amount: float, old_categor
                 "status": "multiple_matches",
                 "matches": [
                     {
-                        "id": r[0],
-                        "date": r[1],
-                        "amount": r[2],
-                        "category": r[3],
-                        "subcategory": r[4],
-                        "note": r[5]
+                        "id": r['id'],
+                        "date": r['date'],
+                        "amount": r['amount'],
+                        "category": r['category'],
+                        "subcategory": r['subcategory'],
+                        "note": r['note']
                     }
                     for r in rows
                 ]
@@ -655,24 +647,21 @@ async def edit_expense(token: str, old_date: str, old_amount: float, old_categor
         await conn.execute(
             """
             UPDATE expenses
-            SET date=?,
-                amount=?,
-                category=?,
-                subcategory=?,
-                note=?
-            WHERE id=?
+            SET date=$1,
+                amount=$2,
+                category=$3,
+                subcategory=$4,
+                note=$5
+            WHERE id=$6
             """,
-            (
-                new_date if new_date is not None else expense[1],
-                new_amount if new_amount is not None else expense[2],
-                new_category if new_category is not None else expense[3],
-                new_subcategory if new_subcategory is not None else expense[4],
-                new_note if new_note is not None else expense[5],
-                expense[0]
-            )
+            new_date if new_date is not None else expense['date'],
+            new_amount if new_amount is not None else expense['amount'],
+            new_category if new_category is not None else expense['category'],
+            new_subcategory if new_subcategory is not None else expense['subcategory'],
+            new_note if new_note is not None else expense['note'],
+            expense['id']
         )
-        await conn.commit()
-        return {"status": "ok", "expense_id": expense[0], "message": "Expense updated successfully"}
+        return {"status": "ok", "expense_id": expense['id'], "message": "Expense updated successfully"}
 
     return await _run_with_connection(_op)
 
@@ -685,15 +674,15 @@ async def add_credit(token: str, date: str, amount: float, source: str, note: st
 
     async with db_lock:
         async def _op(conn):
-            cur = await conn.execute(
+            credit_id = await conn.fetchval(
                 """
                 INSERT INTO credits(user_id, date, amount, source, note)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
                 """,
-                (payload['user_id'], date, amount, source, note)
+                payload['user_id'], date, amount, source, note
             )
-            await conn.commit()
-            return {"status": "ok", "credit_id": cur.lastrowid, "message": "Credit added successfully"}
+            return {"status": "ok", "credit_id": credit_id, "message": "Credit added successfully"}
 
         return await _run_with_connection(_op)
 
@@ -705,18 +694,17 @@ async def list_credits(token: str, start_date: str, end_date: str):
         return {"status": "error", "message": "Invalid or expired token"}
 
     async def _op(conn):
-        cur = await conn.execute(
+        rows = await _execute_fetchall(
+            conn,
             """
             SELECT id, date, amount, source, note
             FROM credits
-            WHERE user_id=? AND date BETWEEN ? AND ?
+            WHERE user_id=$1 AND date BETWEEN $2 AND $3
             ORDER BY date ASC
             """,
             (payload['user_id'], start_date, end_date)
         )
-        cols = [d[0] for d in cur.description]
-        rows = await cur.fetchall()
-        return [dict(zip(cols, row)) for row in rows]
+        return [dict(row) for row in rows]
 
     return await _run_with_connection(_op)
 
@@ -729,8 +717,7 @@ async def add_friend(token: str, name: str, email: str):
 
     async with db_lock:
         async def _op(conn):
-            await conn.execute("INSERT INTO friends(user_id,name,email) VALUES (?,?,?)", (payload['user_id'], name, email))
-            await conn.commit()
+            await conn.execute("INSERT INTO friends(user_id,name,email) VALUES ($1,$2,$3)", payload['user_id'], name, email)
             return {"status": "ok", "message": f"{name} added"}
 
         return await _run_with_connection(_op)
@@ -744,11 +731,10 @@ async def update_friend_email(token: str, name: str, new_email: str):
 
     async with db_lock:
         async def _op(conn):
-            row = await _execute_fetchone(conn, "SELECT id FROM friends WHERE user_id=? AND LOWER(name)=LOWER(?)", (payload['user_id'], name))
+            row = await _execute_fetchone(conn, "SELECT id FROM friends WHERE user_id=$1 AND LOWER(name)=LOWER($2)", (payload['user_id'], name))
             if not row:
                 return {"status": "error", "message": f"Friend '{name}' not found"}
-            await conn.execute("UPDATE friends SET email=? WHERE user_id=? AND LOWER(name)=LOWER(?)", (new_email, payload['user_id'], name))
-            await conn.commit()
+            await conn.execute("UPDATE friends SET email=$1 WHERE user_id=$2 AND LOWER(name)=LOWER($3)", new_email, payload['user_id'], name)
             return {"status": "ok", "message": f"Email updated for {name}"}
 
         return await _run_with_connection(_op)
@@ -762,30 +748,29 @@ async def list_friends(token: str):
 
     async def _op(conn):
         # Get current user info
-        user_row = await _execute_fetchone(conn, "SELECT email, username FROM users WHERE id=?", (payload['user_id'],))
+        user_row = await _execute_fetchone(conn, "SELECT email, username FROM users WHERE id=$1", (payload['user_id'],))
         if not user_row:
             return []
 
-        user_email, username = user_row
+        user_email, username = user_row['email'], user_row['username']
 
         # Get explicit friends (added by this user)
         explicit_rows = await _execute_fetchall(
             conn,
-            "SELECT id, name, email FROM friends WHERE user_id=?",
+            "SELECT id, name, email FROM friends WHERE user_id=$1",
             (payload['user_id'],)
         )
-        explicit_friends = [{'id': r[0], 'name': r[1], 'email': r[2]} for r in explicit_rows]
+        explicit_friends = [{'id': r['id'], 'name': r['name'], 'email': r['email']} for r in explicit_rows]
 
         # Get implicit friends (people who added this user as a friend)
-        # Find all friend entries where the email or name matches this user
         implicit_rows = await _execute_fetchall(
             conn, """
             SELECT DISTINCT f.user_id FROM friends f
             WHERE (
-                (f.email IS NOT NULL AND LOWER(f.email) = LOWER(?))
-                OR (f.name IS NOT NULL AND LOWER(f.name) = LOWER(?))
+                (f.email IS NOT NULL AND LOWER(f.email) = LOWER($1))
+                OR (f.name IS NOT NULL AND LOWER(f.name) = LOWER($2))
             )
-            AND f.user_id != ?
+            AND f.user_id != $3
             """,
             (user_email or '', username, payload['user_id'])
         )
@@ -793,14 +778,15 @@ async def list_friends(token: str):
         implicit_friends = []
         seen_emails = {f['email'] for f in explicit_friends if f['email']}
 
-        for (adder_user_id,) in implicit_rows:
+        for row in implicit_rows:
+            adder_user_id = row['user_id']
             adder_row = await _execute_fetchone(
                 conn,
-                "SELECT username, email FROM users WHERE id=?",
+                "SELECT username, email FROM users WHERE id=$1",
                 (adder_user_id,)
             )
             if adder_row:
-                adder_username, adder_email = adder_row
+                adder_username, adder_email = adder_row['username'], adder_row['email']
                 if adder_email and adder_email not in seen_emails:
                     implicit_friends.append({
                         'id': None,
@@ -827,22 +813,22 @@ async def add_shared_expense(token: str, date: str, amount: float, paid_by: str,
 
     async with db_lock:
         async def _op(conn):
-            cur = await conn.execute(
+            expense_id = await conn.fetchval(
                 """
                 INSERT INTO shared_expenses(user_id, date, description, total_amount, paid_by)
-                VALUES (?,?,?,?,?)
+                VALUES ($1,$2,$3,$4,$5)
+                RETURNING id
                 """,
-                (payload['user_id'], date, description, amount, payer_name)
+                payload['user_id'], date, description, amount, payer_name
             )
-            expense_id = cur.lastrowid
 
             for entry in participant_splits:
                 await conn.execute(
                     """
                     INSERT INTO shared_expense_participants(expense_id, participant, share_amount)
-                    VALUES (?,?,?)
+                    VALUES ($1,$2,$3)
                     """,
-                    (expense_id, entry["name"], entry["share"])
+                    expense_id, entry["name"], entry["share"]
                 )
 
             balances = await _calculate_balances(conn, payload['user_id'])
@@ -850,15 +836,14 @@ async def add_shared_expense(token: str, date: str, amount: float, paid_by: str,
             for entry in participant_splits:
                 person = entry["name"]
                 email_row = await _execute_fetchone(
-                    conn, "SELECT email FROM friends WHERE user_id=? AND LOWER(name)=LOWER(?)",
+                    conn, "SELECT email FROM friends WHERE user_id=$1 AND LOWER(name)=LOWER($2)",
                     (payload['user_id'], person)
                 )
 
-                if email_row and email_row[0]:
+                if email_row and email_row['email']:
                     email_summary = await _build_email_summary(paid_by, amount, description, participant_splits, balances, person)
-                    email_tasks.append(send_email(email_row[0], f"Expense Split: {description}", email_summary))
+                    email_tasks.append(send_email(email_row['email'], f"Expense Split: {description}", email_summary))
 
-            await conn.commit()
             return {"status": "ok", "expense_id": expense_id, "splits": participant_splits}
 
         result = await _run_with_connection(_op)
@@ -882,16 +867,15 @@ async def settle_payment(token: str, person: str, amount: float, settlement_date
             await conn.execute(
                 """
                 INSERT INTO settlements(user_id, person, amount, settlement_date, note)
-                VALUES (?,?,?,?,?)
+                VALUES ($1,$2,$3,$4,$5)
                 """,
-                (payload['user_id'], person, amount, settlement_date, note)
+                payload['user_id'], person, amount, settlement_date, note
             )
 
-            friend_row = await _execute_fetchone(conn, "SELECT email FROM friends WHERE user_id=? AND LOWER(name)=LOWER(?)", (payload['user_id'], person))
-            if friend_row and friend_row[0]:
-                email_tasks.append(send_email(friend_row[0], "Settlement recorded", f"Hi {person},\n\nA settlement of ₹{amount:.2f} was recorded on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"))
+            friend_row = await _execute_fetchone(conn, "SELECT email FROM friends WHERE user_id=$1 AND LOWER(name)=LOWER($2)", (payload['user_id'], person))
+            if friend_row and friend_row['email']:
+                email_tasks.append(send_email(friend_row['email'], "Settlement recorded", f"Hi {person},\n\nA settlement of ₹{amount:.2f} was recorded on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"))
 
-            await conn.commit()
             return {"status": "ok", "message": "Settlement recorded"}
 
         result = await _run_with_connection(_op)
@@ -919,9 +903,12 @@ async def get_balances(token: str):
 
 @mcp.resource("expense://categories", mime_type="application/json")
 async def categories():
-    async with aiofiles.open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+    categories_file = os.path.join(os.getcwd(), "categories.json")
+    if not os.path.exists(categories_file):
+        return "[]"
+    async with aiofiles.open(categories_file, "r", encoding="utf-8") as f:
         return await f.read()
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
