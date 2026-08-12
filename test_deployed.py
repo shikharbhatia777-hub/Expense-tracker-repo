@@ -48,10 +48,15 @@ class DeployedTestRunner:
             }
         }
 
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream"
+        }
+
         print(f"Calling: {tool_name}")
         print(f"URL: {DEPLOYED_URL}")
 
-        response = requests.post(DEPLOYED_URL, json=payload, timeout=30)
+        response = requests.post(DEPLOYED_URL, json=payload, headers=headers, timeout=30)
 
         if response.status_code != 200:
             print(f"HTTP Status: {response.status_code}")
