@@ -1174,32 +1174,146 @@ async def search_expenses(token: str, keyword: str = None, category: str = None,
     return await _run_with_connection(_op)
 
 
-@mcp.tool(description="Get pending settlements - people who owe you money and for how long.")
-async def get_pending_settlements(token: str, days_threshold: int = 7, min_amount: float = 0):
+@mcp.tool(description="Edit a shared expense (description, amount, date).")
+async def edit_shared_expense(token: str, expense_id: int, description: str = None, total_amount: float = None, date: str = None):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async with db_lock:
+        async def _op(conn):
+            expense = await _execute_fetchone(
+                conn, "SELECT id, user_id FROM shared_expenses WHERE id=$1", (expense_id,)
+            )
+            if not expense or expense['user_id'] != payload['user_id']:
+                return {"status": "error", "message": "Shared expense not found or unauthorized"}
+
+            updates = []
+            params = []
+            param_count = 1
+
+            if description is not None:
+                updates.append(f"description=${param_count}")
+                params.append(description)
+                param_count += 1
+            if total_amount is not None:
+                updates.append(f"total_amount=${param_count}")
+                params.append(total_amount)
+                param_count += 1
+            if date is not None:
+                updates.append(f"date=${param_count}")
+                params.append(date)
+                param_count += 1
+
+            if not updates:
+                return {"status": "error", "message": "No fields to update"}
+
+            params.append(expense_id)
+            query = f"UPDATE shared_expenses SET {', '.join(updates)} WHERE id=${param_count} RETURNING id"
+
+            result = await conn.fetchval(query, *params)
+            return {"status": "ok", "expense_id": result, "message": "Shared expense updated successfully"}
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Delete a shared expense by ID.")
+async def delete_shared_expense(token: str, expense_id: int):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async with db_lock:
+        async def _op(conn):
+            expense = await _execute_fetchone(
+                conn, "SELECT id, user_id, description, total_amount, date FROM shared_expenses WHERE id=$1", (expense_id,)
+            )
+            if not expense or expense['user_id'] != payload['user_id']:
+                return {"status": "error", "message": "Shared expense not found or unauthorized"}
+
+            await conn.execute("DELETE FROM shared_expense_participants WHERE expense_id=$1", expense_id)
+            await conn.execute("DELETE FROM shared_expenses WHERE id=$1", expense_id)
+
+            return {
+                "status": "ok",
+                "message": "Shared expense deleted successfully",
+                "deleted": {
+                    "id": expense['id'],
+                    "description": expense['description'],
+                    "total_amount": expense['total_amount'],
+                    "date": expense['date']
+                }
+            }
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Search and filter shared expenses by keyword, amount range, date range, paid_by.")
+async def search_shared_expenses(token: str, keyword: str = None, paid_by: str = None, min_amount: float = None, max_amount: float = None, start_date: str = None, end_date: str = None):
     payload = _verify_token(token)
     if not payload:
         return {"status": "error", "message": "Invalid or expired token"}
 
     async def _op(conn):
-        balances = await _calculate_balances(conn, payload['user_id'])
+        query = "SELECT id, date, description, total_amount, paid_by FROM shared_expenses WHERE user_id=$1"
+        params = [payload['user_id']]
+        param_count = 2
 
-        now = datetime.now(tz.utc)
-        pending = []
+        if keyword:
+            query += f" AND (description ILIKE ${param_count})"
+            keyword_pattern = f"%{keyword}%"
+            params.append(keyword_pattern)
+            param_count += 1
 
-        for person, balance in balances.items():
-            if balance < 0:
-                balance_abs = abs(balance)
-                if balance_abs >= min_amount:
-                    pending.append({
-                        "person": person,
-                        "owes_you": round(balance_abs, 2),
-                        "reminder": f"{person} owes you ₹{balance_abs:.2f}"
-                    })
+        if paid_by:
+            query += f" AND LOWER(paid_by)=LOWER(${param_count})"
+            params.append(paid_by)
+            param_count += 1
+
+        if min_amount is not None:
+            query += f" AND total_amount>=${param_count}"
+            params.append(min_amount)
+            param_count += 1
+
+        if max_amount is not None:
+            query += f" AND total_amount<=${param_count}"
+            params.append(max_amount)
+            param_count += 1
+
+        if start_date:
+            query += f" AND date>=${param_count}"
+            params.append(start_date)
+            param_count += 1
+
+        if end_date:
+            query += f" AND date<=${param_count}"
+            params.append(end_date)
+            param_count += 1
+
+        query += " ORDER BY date DESC"
+
+        rows = await _execute_fetchall(conn, query, tuple(params))
+
+        result_expenses = []
+        for row in rows:
+            participants = await _execute_fetchall(
+                conn,
+                "SELECT participant, share_amount FROM shared_expense_participants WHERE expense_id=$1",
+                (row['id'],)
+            )
+            result_expenses.append({
+                "id": row['id'],
+                "date": row['date'],
+                "description": row['description'],
+                "total_amount": row['total_amount'],
+                "paid_by": row['paid_by'],
+                "participants": [{"name": p['participant'], "share": p['share_amount']} for p in participants]
+            })
 
         return {
             "status": "ok",
-            "pending_count": len(pending),
-            "pending_settlements": sorted(pending, key=lambda x: x['owes_you'], reverse=True)
+            "count": len(result_expenses),
+            "shared_expenses": result_expenses
         }
 
     return await _run_with_connection(_op)
