@@ -3,16 +3,17 @@ import asyncio
 import os
 import asyncpg
 import aiofiles
-from email.mime.text import MIMEText
 import jwt
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone as tz
 
 try:
-    import aiosmtplib
+    from sendgrid import SendGridAPIClient
+    from sendgrid.helpers.mail import Mail
 except ImportError:
-    aiosmtplib = None
+    SendGridAPIClient = None
+    Mail = None
 
 try:
     from dotenv import load_dotenv
@@ -28,11 +29,8 @@ POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "postgres")
 
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME", "shikharbhatia777@gmail.com")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USERNAME)
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "noreply@expensetracker.com")
 
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
 JWT_EXPIRY_HOURS = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
@@ -42,6 +40,8 @@ db_lock = asyncio.Lock()
 _db_initialized = False
 _current_user_id = None
 _db_pool = None
+_email_queue = asyncio.Queue()
+_email_worker_task = None
 
 
 def _hash_password(password: str) -> str:
@@ -394,30 +394,44 @@ async def send_email(recipient, subject, body):
         print("Email skipped: no recipient provided")
         return False
 
-    if not SMTP_PASSWORD:
-        print("Email skipped: SMTP_PASSWORD is not configured")
+    if not SENDGRID_API_KEY:
+        print("Email skipped: SENDGRID_API_KEY is not configured")
         return False
 
-    if not aiosmtplib:
-        print("Email skipped: aiosmtplib not installed")
+    if not SendGridAPIClient or not Mail:
+        print("Email skipped: SendGrid not installed")
         return False
 
     try:
-        text = body if body else ""
-        msg = MIMEText(text, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = SMTP_FROM
-        msg["To"] = recipient
-
-        async with aiosmtplib.SMTP(hostname=SMTP_HOST, port=SMTP_PORT) as smtp:
-            await smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-            await smtp.send_message(msg)
-
-        print(f"Email sent to {recipient}")
+        message = Mail(
+            from_email=SMTP_FROM,
+            to_emails=recipient,
+            subject=subject,
+            plain_text_content=body
+        )
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"Email sent to {recipient} (Status: {response.status_code})")
         return True
     except Exception as e:
         print(f"Email failed: {e}")
         return False
+
+
+def queue_email(recipient, subject, body):
+    try:
+        _email_queue.put_nowait((recipient, subject, body))
+    except asyncio.QueueFull:
+        print(f"Email queue full, dropping email to {recipient}")
+
+
+async def _email_worker():
+    while True:
+        try:
+            recipient, subject, body = await _email_queue.get()
+            await send_email(recipient, subject, body)
+        except Exception as e:
+            print(f"Email worker error: {e}")
 
 
 async def _ensure_db_initialized():
@@ -809,8 +823,6 @@ async def add_shared_expense(token: str, date: str, amount: float, paid_by: str,
     participant_splits = await _build_participant_splits(amount, participants, paid_by)
     payer_name = await _normalize_payer_name(paid_by)
 
-    email_tasks = []
-
     async with db_lock:
         async def _op(conn):
             expense_id = await conn.fetchval(
@@ -842,14 +854,11 @@ async def add_shared_expense(token: str, date: str, amount: float, paid_by: str,
 
                 if email_row and email_row['email']:
                     email_summary = await _build_email_summary(paid_by, amount, description, participant_splits, balances, person)
-                    email_tasks.append(send_email(email_row['email'], f"Expense Split: {description}", email_summary))
+                    queue_email(email_row['email'], f"Expense Split: {description}", email_summary)
 
             return {"status": "ok", "expense_id": expense_id, "splits": participant_splits}
 
         result = await _run_with_connection(_op)
-
-    if email_tasks:
-        await asyncio.gather(*email_tasks, return_exceptions=True)
 
     return result
 
@@ -874,17 +883,11 @@ async def settle_payment(token: str, person: str, amount: float, settlement_date
 
             friend_row = await _execute_fetchone(conn, "SELECT email FROM friends WHERE user_id=$1 AND LOWER(name)=LOWER($2)", (payload['user_id'], person))
             if friend_row and friend_row['email']:
-                email_tasks.append(send_email(friend_row['email'], "Settlement recorded", f"Hi {person},\n\nA settlement of ₹{amount:.2f} was recorded on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"))
+                queue_email(friend_row['email'], "Settlement recorded", f"Hi {person},\n\nA settlement of ₹{amount:.2f} was recorded on {settlement_date}.\n\nNote: {note or 'No note provided'}\n")
 
             return {"status": "ok", "message": "Settlement recorded"}
 
         result = await _run_with_connection(_op)
-
-    if person and person.lower() != "you":
-        email_tasks.append(send_email(SMTP_USERNAME, "Settlement recorded", f"Hi there,\n\nA settlement of ₹{amount:.2f} was recorded for {person} on {settlement_date}.\n\nNote: {note or 'No note provided'}\n"))
-
-    if email_tasks:
-        await asyncio.gather(*email_tasks, return_exceptions=True)
 
     return result
 
@@ -911,4 +914,14 @@ async def categories():
 
 
 if __name__ == "__main__":
+    import threading
+
+    def run_email_worker():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_email_worker())
+
+    worker_thread = threading.Thread(target=run_email_worker, daemon=True)
+    worker_thread.start()
+
     mcp.run(transport="http", host="0.0.0.0", port=8000)
