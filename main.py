@@ -391,47 +391,59 @@ async def _build_email_summary(paid_by: str, amount: float, description: str, pa
 
 async def send_email(recipient, subject, body):
     if not recipient:
-        print("Email skipped: no recipient provided")
+        print("[EMAIL] ❌ Skipped: no recipient provided")
         return False
 
     if not SENDGRID_API_KEY:
-        print("Email skipped: SENDGRID_API_KEY is not configured")
+        print("[EMAIL] ❌ Skipped: SENDGRID_API_KEY not configured")
         return False
 
     if not SendGridAPIClient or not Mail:
-        print("Email skipped: SendGrid not installed")
+        print("[EMAIL] ❌ Skipped: SendGrid library not installed")
         return False
 
     try:
+        print(f"[EMAIL] 📧 Preparing email to {recipient}...")
         message = Mail(
             from_email=SMTP_FROM,
             to_emails=recipient,
             subject=subject,
             plain_text_content=body
         )
+        print(f"[EMAIL] 🔑 Using API key: {SENDGRID_API_KEY[:20]}...")
         sg = SendGridAPIClient(SENDGRID_API_KEY)
         response = sg.send(message)
-        print(f"Email sent to {recipient} (Status: {response.status_code})")
+        print(f"[EMAIL] ✅ Email sent to {recipient} (Status: {response.status_code})")
         return True
     except Exception as e:
-        print(f"Email failed: {e}")
+        print(f"[EMAIL] ❌ Failed: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
 def queue_email(recipient, subject, body):
     try:
+        print(f"[QUEUE] 📬 Queuing email to {recipient}")
         _email_queue.put_nowait((recipient, subject, body))
+        print(f"[QUEUE] ✅ Email queued (Queue size: {_email_queue.qsize()})")
     except asyncio.QueueFull:
-        print(f"Email queue full, dropping email to {recipient}")
+        print(f"[QUEUE] ❌ Queue full, dropping email to {recipient}")
+    except Exception as e:
+        print(f"[QUEUE] ❌ Error: {e}")
 
 
 async def _email_worker():
+    print("[WORKER] 🚀 Email worker started")
     while True:
         try:
             recipient, subject, body = await _email_queue.get()
+            print(f"[WORKER] 📨 Processing email to {recipient}")
             await send_email(recipient, subject, body)
         except Exception as e:
-            print(f"Email worker error: {e}")
+            print(f"[WORKER] ❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 async def _ensure_db_initialized():
@@ -847,14 +859,18 @@ async def add_shared_expense(token: str, date: str, amount: float, paid_by: str,
 
             for entry in participant_splits:
                 person = entry["name"]
+                print(f"[EXPENSE] 🔍 Looking up email for participant: {person}")
                 email_row = await _execute_fetchone(
                     conn, "SELECT email FROM friends WHERE user_id=$1 AND LOWER(name)=LOWER($2)",
                     (payload['user_id'], person)
                 )
 
                 if email_row and email_row['email']:
+                    print(f"[EXPENSE] 📧 Found email: {email_row['email']}")
                     email_summary = await _build_email_summary(paid_by, amount, description, participant_splits, balances, person)
                     queue_email(email_row['email'], f"Expense Split: {description}", email_summary)
+                else:
+                    print(f"[EXPENSE] ⚠️  No email found for {person}")
 
             return {"status": "ok", "expense_id": expense_id, "splits": participant_splits}
 
