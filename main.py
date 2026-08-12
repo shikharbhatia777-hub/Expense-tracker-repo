@@ -112,6 +112,8 @@ async def init_db():
             database=POSTGRES_DB,
             min_size=5,
             max_size=20,
+            command_timeout=10,
+            statement_cache_size=0,
         )
 
         conn = await _db_pool.acquire()
