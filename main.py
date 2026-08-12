@@ -1174,7 +1174,7 @@ async def search_expenses(token: str, keyword: str = None, category: str = None,
     return await _run_with_connection(_op)
 
 
-@mcp.tool(description="Edit a shared expense (description, amount, date).")
+@mcp.tool(description="Edit a shared expense (description, amount, date). When total_amount changes, participant shares are recalculated proportionally to maintain the same split ratio.")
 async def edit_shared_expense(token: str, expense_id: int, description: str = None, total_amount: float = None, date: str = None):
     payload = _verify_token(token)
     if not payload:
@@ -1183,10 +1183,12 @@ async def edit_shared_expense(token: str, expense_id: int, description: str = No
     async with db_lock:
         async def _op(conn):
             expense = await _execute_fetchone(
-                conn, "SELECT id, user_id FROM shared_expenses WHERE id=$1", (expense_id,)
+                conn, "SELECT id, user_id, total_amount FROM shared_expenses WHERE id=$1", (expense_id,)
             )
             if not expense or expense['user_id'] != payload['user_id']:
                 return {"status": "error", "message": "Shared expense not found or unauthorized"}
+
+            original_total = float(expense['total_amount'])
 
             updates = []
             params = []
@@ -1209,10 +1211,36 @@ async def edit_shared_expense(token: str, expense_id: int, description: str = No
                 return {"status": "error", "message": "No fields to update"}
 
             params.append(expense_id)
-            query = f"UPDATE shared_expenses SET {', '.join(updates)} WHERE id=${param_count} RETURNING id"
+            query = f"UPDATE shared_expenses SET {', '.join(updates)} WHERE id=${param_count} RETURNING id, total_amount"
 
-            result = await conn.fetchval(query, *params)
-            return {"status": "ok", "expense_id": result, "message": "Shared expense updated successfully"}
+            result = await conn.fetchrow(query, *params)
+            new_total = float(result['total_amount']) if result else original_total
+
+            # If total_amount was changed, recalculate participant shares proportionally
+            if total_amount is not None and original_total > 0:
+                participants = await _execute_fetchall(
+                    conn,
+                    "SELECT id, participant, share_amount FROM shared_expense_participants WHERE expense_id=$1",
+                    (expense_id,)
+                )
+
+                for participant in participants:
+                    original_share = float(participant['share_amount'])
+                    proportion = original_share / original_total
+                    new_share = round(new_total * proportion, 2)
+
+                    await conn.execute(
+                        "UPDATE shared_expense_participants SET share_amount=$1 WHERE id=$2",
+                        new_share,
+                        participant['id']
+                    )
+
+            return {
+                "status": "ok",
+                "expense_id": result['id'] if result else expense_id,
+                "message": "Shared expense updated successfully",
+                "shares_recalculated": total_amount is not None
+            }
 
         return await _run_with_connection(_op)
 
