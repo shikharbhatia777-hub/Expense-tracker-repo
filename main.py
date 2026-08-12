@@ -279,9 +279,10 @@ async def _calculate_balances(conn, user_id: int):
         amount_value = round(float(amount), 2)
         current_balance = balances.get(person_name, 0.0)
 
-        # When a person settles with you, reduce what they owe you
-        # Settlement reduces the balance (you receive money from them)
-        balances[person_name] = round(current_balance - amount_value, 2)
+        # When a person settles with you, move balance towards zero
+        # If they owe you (negative balance) and they pay, ADD the settlement
+        # Example: -₹4,900 + ₹1,000 = -₹3,900 (still owes, but less)
+        balances[person_name] = round(current_balance + amount_value, 2)
 
     return {name: round(balance, 2) for name, balance in balances.items()}
 
