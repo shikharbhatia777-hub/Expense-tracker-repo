@@ -1008,6 +1008,35 @@ async def get_balances(token: str):
     return await _run_with_connection(_op)
 
 
+@mcp.tool(description="List all settlement records made by the current user.")
+async def list_settlements(token: str):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async def _op(conn):
+        settlements = await _execute_fetchall(
+            conn,
+            "SELECT id, person, amount, settlement_date, note FROM settlements WHERE user_id=$1 ORDER BY settlement_date DESC",
+            (payload['user_id'],)
+        )
+        return {
+            "status": "ok",
+            "settlements": [
+                {
+                    "id": s['id'],
+                    "person": s['person'],
+                    "amount": s['amount'],
+                    "date": s['settlement_date'],
+                    "note": s['note']
+                }
+                for s in settlements
+            ]
+        }
+
+    return await _run_with_connection(_op)
+
+
 @mcp.resource("expense://categories", mime_type="application/json")
 async def categories():
     categories_file = os.path.join(os.getcwd(), "categories.json")
