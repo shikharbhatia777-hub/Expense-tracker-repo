@@ -429,27 +429,33 @@ async def send_email(recipient, subject, body):
 def queue_email(recipient, subject, body):
     try:
         print(f"[QUEUE] 📬 Queuing email to {recipient}")
+        print(f"[QUEUE] 📝 Subject: {subject}")
         _email_queue.put((recipient, subject, body), block=False)
-        print(f"[QUEUE] ✅ Email queued (Queue size: {_email_queue.qsize()})")
+        print(f"[QUEUE] ✅ Email queued successfully (Queue size now: {_email_queue.qsize()})")
     except queue.Full:
         print(f"[QUEUE] ❌ Queue full, dropping email to {recipient}")
     except Exception as e:
-        print(f"[QUEUE] ❌ Error: {e}")
+        print(f"[QUEUE] ❌ Error queuing: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def run_email_worker():
     print("[WORKER] 🚀 Email worker started")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    print(f"[WORKER] 📊 Queue size at start: {_email_queue.qsize()}")
     while True:
         try:
+            print(f"[WORKER] ⏳ Waiting for email (queue size: {_email_queue.qsize()})...")
             recipient, subject, body = _email_queue.get(timeout=1)
-            print(f"[WORKER] 📨 Processing email to {recipient}")
+            print(f"[WORKER] 📨 Got email from queue! Processing to {recipient}")
             loop.run_until_complete(send_email(recipient, subject, body))
+            print(f"[WORKER] ✅ Email processed successfully")
         except queue.Empty:
-            continue
+            pass
         except Exception as e:
-            print(f"[WORKER] ❌ Error: {e}")
+            print(f"[WORKER] ❌ Critical Error: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
 
