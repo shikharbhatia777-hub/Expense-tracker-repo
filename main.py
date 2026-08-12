@@ -18,6 +18,12 @@ except ImportError:
     Mail = None
 
 try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+except ImportError:
+    Workbook = None
+
+try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover
     load_dotenv = None
@@ -1033,6 +1039,299 @@ async def list_settlements(token: str):
                 }
                 for s in settlements
             ]
+        }
+
+    return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Edit an existing expense (amount, category, date, note).")
+async def edit_expense(token: str, expense_id: int, amount: float = None, category: str = None, date: str = None, note: str = None):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async with db_lock:
+        async def _op(conn):
+            expense = await _execute_fetchone(
+                conn, "SELECT id, user_id FROM expenses WHERE id=$1", (expense_id,)
+            )
+            if not expense or expense['user_id'] != payload['user_id']:
+                return {"status": "error", "message": "Expense not found or unauthorized"}
+
+            updates = []
+            params = []
+            param_count = 1
+
+            if amount is not None:
+                updates.append(f"amount=${param_count}")
+                params.append(amount)
+                param_count += 1
+            if category is not None:
+                updates.append(f"category=${param_count}")
+                params.append(category)
+                param_count += 1
+            if date is not None:
+                updates.append(f"date=${param_count}")
+                params.append(date)
+                param_count += 1
+            if note is not None:
+                updates.append(f"note=${param_count}")
+                params.append(note)
+                param_count += 1
+
+            if not updates:
+                return {"status": "error", "message": "No fields to update"}
+
+            params.append(expense_id)
+            query = f"UPDATE expenses SET {', '.join(updates)} WHERE id=${param_count} RETURNING id"
+
+            result = await conn.fetchval(query, *params)
+            return {"status": "ok", "expense_id": result, "message": "Expense updated successfully"}
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Delete an expense by ID.")
+async def delete_expense(token: str, expense_id: int):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async with db_lock:
+        async def _op(conn):
+            expense = await _execute_fetchone(
+                conn, "SELECT id, user_id, amount, category, date FROM expenses WHERE id=$1", (expense_id,)
+            )
+            if not expense or expense['user_id'] != payload['user_id']:
+                return {"status": "error", "message": "Expense not found or unauthorized"}
+
+            await conn.execute("DELETE FROM expenses WHERE id=$1", expense_id)
+            return {
+                "status": "ok",
+                "message": "Expense deleted successfully",
+                "deleted": {
+                    "id": expense['id'],
+                    "amount": expense['amount'],
+                    "category": expense['category'],
+                    "date": expense['date']
+                }
+            }
+
+        return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Search and filter expenses by keyword, category, amount range, date range.")
+async def search_expenses(token: str, keyword: str = None, category: str = None, min_amount: float = None, max_amount: float = None, start_date: str = None, end_date: str = None):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async def _op(conn):
+        query = "SELECT id, date, amount, category, subcategory, note FROM expenses WHERE user_id=$1"
+        params = [payload['user_id']]
+        param_count = 2
+
+        if keyword:
+            query += f" AND (note ILIKE ${param_count} OR category ILIKE ${param_count} OR subcategory ILIKE ${param_count})"
+            keyword_pattern = f"%{keyword}%"
+            params.extend([keyword_pattern, keyword_pattern, keyword_pattern])
+            param_count += 3
+
+        if category:
+            query += f" AND category=${param_count}"
+            params.append(category)
+            param_count += 1
+
+        if min_amount is not None:
+            query += f" AND amount>=${param_count}"
+            params.append(min_amount)
+            param_count += 1
+
+        if max_amount is not None:
+            query += f" AND amount<=${param_count}"
+            params.append(max_amount)
+            param_count += 1
+
+        if start_date:
+            query += f" AND date>=${param_count}"
+            params.append(start_date)
+            param_count += 1
+
+        if end_date:
+            query += f" AND date<=${param_count}"
+            params.append(end_date)
+            param_count += 1
+
+        query += " ORDER BY date DESC"
+
+        rows = await _execute_fetchall(conn, query, tuple(params))
+        return {
+            "status": "ok",
+            "count": len(rows),
+            "expenses": [dict(r) for r in rows]
+        }
+
+    return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Get pending settlements - people who owe you money and for how long.")
+async def get_pending_settlements(token: str, days_threshold: int = 7, min_amount: float = 0):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async def _op(conn):
+        balances = await _calculate_balances(conn, payload['user_id'])
+
+        now = datetime.now(tz.utc)
+        pending = []
+
+        for person, balance in balances.items():
+            if balance < 0:
+                balance_abs = abs(balance)
+                if balance_abs >= min_amount:
+                    pending.append({
+                        "person": person,
+                        "owes_you": round(balance_abs, 2),
+                        "reminder": f"{person} owes you ₹{balance_abs:.2f}"
+                    })
+
+        return {
+            "status": "ok",
+            "pending_count": len(pending),
+            "pending_settlements": sorted(pending, key=lambda x: x['owes_you'], reverse=True)
+        }
+
+    return await _run_with_connection(_op)
+
+
+@mcp.tool(description="Export expenses to Excel file. Filter by category, date range, type (personal/shared).")
+async def export_expenses_to_excel(token: str, start_date: str = None, end_date: str = None, category: str = None, include_shared: bool = True):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    if Workbook is None:
+        return {"status": "error", "message": "Excel library not installed. Run: pip install openpyxl"}
+
+    async def _op(conn):
+        user = await _execute_fetchone(conn, "SELECT username FROM users WHERE id=$1", (payload['user_id'],))
+        username = user['username'] if user else "User"
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Expenses"
+
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+
+        headers = ["ID", "Date", "Amount", "Category", "Subcategory", "Note", "Type"]
+        ws.append(headers)
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+        query = "SELECT id, date, amount, category, subcategory, note FROM expenses WHERE user_id=$1"
+        params = [payload['user_id']]
+        param_count = 2
+
+        if start_date:
+            query += f" AND date>=${param_count}"
+            params.append(start_date)
+            param_count += 1
+
+        if end_date:
+            query += f" AND date<=${param_count}"
+            params.append(end_date)
+            param_count += 1
+
+        if category:
+            query += f" AND category=${param_count}"
+            params.append(category)
+            param_count += 1
+
+        query += " ORDER BY date DESC"
+        expenses = await _execute_fetchall(conn, query, tuple(params))
+
+        for expense in expenses:
+            ws.append([
+                expense['id'],
+                expense['date'],
+                expense['amount'],
+                expense['category'],
+                expense['subcategory'],
+                expense['note'],
+                "Personal"
+            ])
+
+        if include_shared:
+            ws_shared = wb.create_sheet("Shared Expenses")
+            ws_shared.append(headers + ["Paid By", "Participants"])
+
+            for cell in ws_shared[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
+
+            shared_query = """
+                SELECT se.id, se.date, se.total_amount, se.description, se.paid_by
+                FROM shared_expenses se
+                WHERE se.user_id=$1
+            """
+            shared_params = [payload['user_id']]
+            if start_date:
+                shared_query += f" AND se.date>={len(shared_params)+1}"
+                shared_params.append(start_date)
+            if end_date:
+                shared_query += f" AND se.date<={len(shared_params)+1}"
+                shared_params.append(end_date)
+            shared_query += " ORDER BY se.date DESC"
+
+            shared_expenses = await _execute_fetchall(conn, shared_query, tuple(shared_params))
+
+            for se in shared_expenses:
+                participants = await _execute_fetchall(
+                    conn,
+                    "SELECT participant FROM shared_expense_participants WHERE expense_id=$1",
+                    (se['id'],)
+                )
+                participant_names = ", ".join([p['participant'] for p in participants])
+                ws_shared.append([
+                    se['id'],
+                    se['date'],
+                    se['total_amount'],
+                    se['description'],
+                    "",
+                    "",
+                    "Shared",
+                    se['paid_by'],
+                    participant_names
+                ])
+
+        for ws in wb.sheetnames:
+            for column in wb[ws].columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                wb[ws].column_dimensions[column_letter].width = adjusted_width
+
+        file_path = f"/tmp/expenses_{username}_{datetime.now(tz.utc).strftime('%Y%m%d_%H%M%S')}.xlsx"
+        wb.save(file_path)
+
+        return {
+            "status": "ok",
+            "message": "Excel file exported successfully",
+            "file_path": file_path,
+            "file_size": os.path.getsize(file_path),
+            "sheets": ["Expenses", "Shared Expenses"] if include_shared else ["Expenses"]
         }
 
     return await _run_with_connection(_op)
