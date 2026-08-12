@@ -893,6 +893,64 @@ async def add_shared_expense(token: str, date: str, amount: float, paid_by: str,
     return result
 
 
+@mcp.tool(description="List all shared expenses for the current user with participant details.")
+async def list_shared_expenses(token: str, start_date: str = None, end_date: str = None):
+    payload = _verify_token(token)
+    if not payload:
+        return {"status": "error", "message": "Invalid or expired token"}
+
+    async def _op(conn):
+        if start_date and end_date:
+            rows = await _execute_fetchall(
+                conn,
+                """
+                SELECT id, date, description, total_amount, paid_by
+                FROM shared_expenses
+                WHERE user_id=$1 AND date BETWEEN $2 AND $3
+                ORDER BY date DESC
+                """,
+                (payload['user_id'], start_date, end_date)
+            )
+        else:
+            rows = await _execute_fetchall(
+                conn,
+                """
+                SELECT id, date, description, total_amount, paid_by
+                FROM shared_expenses
+                WHERE user_id=$1
+                ORDER BY date DESC
+                """,
+                (payload['user_id'],)
+            )
+
+        result = []
+        for row in rows:
+            expense_id = row['id']
+            participants = await _execute_fetchall(
+                conn,
+                """
+                SELECT participant, share_amount
+                FROM shared_expense_participants
+                WHERE expense_id=$1
+                ORDER BY participant ASC
+                """,
+                (expense_id,)
+            )
+
+            result.append({
+                "id": expense_id,
+                "date": row['date'],
+                "description": row['description'],
+                "total_amount": row['total_amount'],
+                "paid_by": row['paid_by'],
+                "participants": [{"name": p['participant'], "share": p['share_amount']} for p in participants]
+            })
+
+        return result
+
+    return await _run_with_connection(_op)
+
+
 @mcp.tool(description="Record a settlement payment and notify the involved parties.")
 async def settle_payment(token: str, person: str, amount: float, settlement_date: str, note: str = ""):
     payload = _verify_token(token)
