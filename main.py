@@ -1632,9 +1632,14 @@ def health():
 
 @app.route('/server-date', methods=['GET'])
 def server_date():
-    """Return the current server date"""
-    today = datetime.now(tz.utc).date().isoformat()
-    return jsonify({"date": today, "timestamp": datetime.now(tz.utc).isoformat()})
+    """Return the current server date and timestamp"""
+    now = datetime.now(tz.utc)
+    today = now.date().isoformat()
+    return jsonify({
+        "date": today,
+        "timestamp": now.isoformat(),
+        "unix_timestamp": now.timestamp()
+    })
 
 
 @app.route('/', methods=['GET'])
