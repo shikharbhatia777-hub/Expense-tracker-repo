@@ -555,7 +555,7 @@ async def verify_token(token: str):
 
 
 @mcp.tool(description="Add a new regular expense entry to the database.")
-async def add_expense(token: str, date, amount, category, subcategory="", note=""):
+async def add_expense(token: str, date: str, amount, category: str, subcategory: str = "", note: str = ""):
     payload = _verify_token(token)
     if not payload:
         return {"status": "error", "message": "Invalid or expired token"}
@@ -564,7 +564,7 @@ async def add_expense(token: str, date, amount, category, subcategory="", note="
         async def _op(conn):
             expense_id = await conn.fetchval(
                 "INSERT INTO expenses(user_id, date, amount, category, subcategory, note) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
-                payload['user_id'], date, amount, category, subcategory, note
+                payload['user_id'], date, float(amount), category, subcategory, note
             )
             return {"status": "ok", "id": expense_id}
 
@@ -1571,6 +1571,23 @@ def get_event_loop():
     return _event_loop
 
 
+def _coerce_arguments(tool_name, arguments):
+    """Coerce string arguments to appropriate types based on common patterns"""
+    coerced = {}
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            if key in ('amount', 'min_amount', 'max_amount', 'share'):
+                try:
+                    coerced[key] = float(value)
+                except (ValueError, TypeError):
+                    coerced[key] = value
+            else:
+                coerced[key] = value
+        else:
+            coerced[key] = value
+    return coerced
+
+
 @app.route('/mcp/call_tool', methods=['POST'])
 def call_tool():
     """Execute a tool from the MCP server"""
@@ -1588,12 +1605,15 @@ def call_tool():
 
     try:
         tool_func = _tool_registry[tool_name]
+        # Coerce arguments to appropriate types
+        coerced_args = _coerce_arguments(tool_name, arguments)
+
         # Check if the tool is async
         if asyncio.iscoroutinefunction(tool_func):
             loop = get_event_loop()
-            result = loop.run_until_complete(tool_func(**arguments))
+            result = loop.run_until_complete(tool_func(**coerced_args))
         else:
-            result = tool_func(**arguments)
+            result = tool_func(**coerced_args)
         return jsonify({"result": result, "success": True})
     except Exception as e:
         logger.error(f"Tool execution error for {tool_name}: {e}", exc_info=True)
