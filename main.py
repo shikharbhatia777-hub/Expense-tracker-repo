@@ -56,6 +56,24 @@ _db_pool = None
 _email_queue = queue.Queue()
 _email_worker_task = None
 
+# Tool registry for Flask endpoints
+_tool_registry = {}
+
+# Wrap mcp.tool to also register in our registry
+_original_tool = mcp.tool
+
+def _wrapped_tool(*args, **kwargs):
+    """Wrapper around mcp.tool that also registers in _tool_registry"""
+    def decorator(func):
+        # First register with FastMCP
+        wrapped = _original_tool(*args, **kwargs)(func)
+        # Then register in our registry using the function name
+        _tool_registry[func.__name__] = func
+        return wrapped
+    return decorator
+
+mcp.tool = _wrapped_tool
+
 
 def _hash_password(password: str) -> str:
     salt = secrets.token_hex(32)
@@ -1532,8 +1550,7 @@ def get_tool_schema(tool):
 def get_tools():
     """Return available tools from MCP server"""
     tools = []
-    for tool_name in mcp._tools:
-        tool_func = mcp._tools[tool_name]
+    for tool_name, tool_func in _tool_registry.items():
         tools.append({
             "name": tool_name,
             "description": (tool_func.__doc__ or "").strip(),
@@ -1552,11 +1569,13 @@ def call_tool():
     if not tool_name:
         return jsonify({"error": "Tool name required"}), 400
 
-    if tool_name not in mcp._tools:
+    if tool_name not in _tool_registry:
+        logger.warning(f"Unknown tool requested: {tool_name}")
+        logger.info(f"Available tools: {list(_tool_registry.keys())}")
         return jsonify({"error": f"Unknown tool: {tool_name}"}), 404
 
     try:
-        tool_func = mcp._tools[tool_name]
+        tool_func = _tool_registry[tool_name]
         # Check if the tool is async
         if asyncio.iscoroutinefunction(tool_func):
             loop = asyncio.new_event_loop()
@@ -1569,7 +1588,7 @@ def call_tool():
             result = tool_func(**arguments)
         return jsonify({"result": result, "success": True})
     except Exception as e:
-        logger.error(f"Tool execution error: {e}", exc_info=True)
+        logger.error(f"Tool execution error for {tool_name}: {e}", exc_info=True)
         return jsonify({"error": str(e), "success": False}), 500
 
 
