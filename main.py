@@ -1578,12 +1578,7 @@ def call_tool():
         tool_func = _tool_registry[tool_name]
         # Check if the tool is async
         if asyncio.iscoroutinefunction(tool_func):
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(tool_func(**arguments))
-            finally:
-                loop.close()
+            result = asyncio.run(tool_func(**arguments))
         else:
             result = tool_func(**arguments)
         return jsonify({"result": result, "success": True})
