@@ -1559,6 +1559,18 @@ def get_tools():
     return jsonify({"tools": tools})
 
 
+# Global event loop for async operations
+_event_loop = None
+
+def get_event_loop():
+    """Get or create the global event loop"""
+    global _event_loop
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_event_loop)
+    return _event_loop
+
+
 @app.route('/mcp/call_tool', methods=['POST'])
 def call_tool():
     """Execute a tool from the MCP server"""
@@ -1578,7 +1590,8 @@ def call_tool():
         tool_func = _tool_registry[tool_name]
         # Check if the tool is async
         if asyncio.iscoroutinefunction(tool_func):
-            result = asyncio.run(tool_func(**arguments))
+            loop = get_event_loop()
+            result = loop.run_until_complete(tool_func(**arguments))
         else:
             result = tool_func(**arguments)
         return jsonify({"result": result, "success": True})
