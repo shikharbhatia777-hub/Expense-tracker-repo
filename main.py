@@ -1512,7 +1512,11 @@ async def categories():
 
 
 app = Flask(__name__)
-CORS(app, resources={r"/mcp/*": {"origins": "*"}})
+CORS(app, resources={
+    r"/mcp/*": {"origins": "*"},
+    r"/server-date": {"origins": "*"},
+    r"/health": {"origins": "*"}
+})
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
