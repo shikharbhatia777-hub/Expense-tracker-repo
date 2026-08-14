@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: expense-tracker-repo
+    runtime: python
+    pythonVersion: 3.12
+    buildCommand: "pip install uv && uv sync"
+    startCommand: "python main.py"
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: POSTGRES_HOST
+        fromDatabase:
+          name: postgres
+          property: host
+      - key: POSTGRES_PORT
+        fromDatabase:
+          name: postgres
+          property: port
+      - key: POSTGRES_USER
+        fromDatabase:
+          name: postgres
+          property: user
+      - key: POSTGRES_PASSWORD
+        fromDatabase:
+          name: postgres
+          property: password
+      - key: POSTGRES_DB
+        fromDatabase:
+          name: postgres
+          property: database
