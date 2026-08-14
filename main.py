@@ -11,6 +11,7 @@ import threading
 import json
 from datetime import datetime, timedelta, timezone as tz
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from werkzeug.serving import run_simple
 import logging
 
@@ -1493,6 +1494,7 @@ async def categories():
 
 
 app = Flask(__name__)
+CORS(app, resources={r"/mcp/*": {"origins": "*"}})
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
