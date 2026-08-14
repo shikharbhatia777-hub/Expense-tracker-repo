@@ -1626,6 +1626,13 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route('/server-date', methods=['GET'])
+def server_date():
+    """Return the current server date"""
+    today = datetime.now(tz.utc).date().isoformat()
+    return jsonify({"date": today, "timestamp": datetime.now(tz.utc).isoformat()})
+
+
 @app.route('/', methods=['GET'])
 def index():
     """Root endpoint"""
