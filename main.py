@@ -8,7 +8,11 @@ import hashlib
 import secrets
 import queue
 import threading
+import json
 from datetime import datetime, timedelta, timezone as tz
+from flask import Flask, request, jsonify
+from werkzeug.serving import run_simple
+import logging
 
 try:
     from sendgrid import SendGridAPIClient
@@ -1488,5 +1492,97 @@ async def categories():
         return await f.read()
 
 
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def get_tool_schema(tool):
+    """Extract schema from a FastMCP tool"""
+    if hasattr(tool, '__doc__'):
+        doc = tool.__doc__ or ""
+    else:
+        doc = ""
+
+    import inspect
+    sig = inspect.signature(tool)
+    properties = {}
+    required = []
+
+    for param_name, param in sig.parameters.items():
+        if param_name == 'self':
+            continue
+        properties[param_name] = {
+            "type": "string",
+            "description": f"Parameter {param_name}"
+        }
+        if param.default == inspect.Parameter.empty:
+            required.append(param_name)
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required
+    }
+
+
+@app.route('/mcp/tools', methods=['GET'])
+def get_tools():
+    """Return available tools from MCP server"""
+    tools = []
+    for tool_name in mcp._tools:
+        tool_func = mcp._tools[tool_name]
+        tools.append({
+            "name": tool_name,
+            "description": (tool_func.__doc__ or "").strip(),
+            "inputSchema": get_tool_schema(tool_func)
+        })
+    return jsonify({"tools": tools})
+
+
+@app.route('/mcp/call_tool', methods=['POST'])
+def call_tool():
+    """Execute a tool from the MCP server"""
+    data = request.json
+    tool_name = data.get('name')
+    arguments = data.get('arguments', {})
+
+    if not tool_name:
+        return jsonify({"error": "Tool name required"}), 400
+
+    if tool_name not in mcp._tools:
+        return jsonify({"error": f"Unknown tool: {tool_name}"}), 404
+
+    try:
+        tool_func = mcp._tools[tool_name]
+        # Check if the tool is async
+        if asyncio.iscoroutinefunction(tool_func):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(tool_func(**arguments))
+            finally:
+                loop.close()
+        else:
+            result = tool_func(**arguments)
+        return jsonify({"result": result, "success": True})
+    except Exception as e:
+        logger.error(f"Tool execution error: {e}", exc_info=True)
+        return jsonify({"error": str(e), "success": False}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({"status": "ok"})
+
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint"""
+    return jsonify({"message": "Expense Tracker MCP Server", "status": "running"})
+
+
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port, debug=False)
